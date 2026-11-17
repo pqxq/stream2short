@@ -1,29 +1,84 @@
-# ClipForge Studio
+# ShortStack
 
-**Open-source, multi-game, multi-language vertical clip automation.**
+ShortStack is a local-first Streamlit studio that turns gaming clips into 9:16 YouTube Shorts and TikToks. It fetches clips for any Twitch game, transcribes them in their native language, renders vertical composites with FFmpeg, and optionally schedules uploads to per-language YouTube channels.
 
-ClipForge Studio is a local-first Streamlit studio that turns gaming clips into polished `9:16` YouTube Shorts and TikToks. It is game-agnostic and language-first: fetch clips for any Twitch game, transcribe in the clip's native language, generate localized hooks/captions/CTAs, optionally translate into a second language, and publish to per-language YouTube channels.
+![ShortStack preview](docs/preview.png)
 
-## Features
+## Capabilities
 
-- **Any game, any language niche** — dynamic Twitch game lookup plus ISO-639-1 language selection (`en`, `uk`, `es`, `de`, `fr`, `pl`, `pt`, `ru`, `ja`, `ko`, and custom codes).
-- **Language-first discovery** — because Twitch `/helix/clips` has no language parameter, the fetcher paginates up to 10 pages of 100 clips and filters by `clip['language']` until your limit is reached.
-- **Native transcription** — `faster-whisper` runs locally on CPU (`int8`) in the selected clip language.
-- **Native metadata** — localized viral hook banner, YouTube title, description/hashtags and pinned-comment CTA for every supported language.
-- **Optional translation** — add a second language variant through an OpenAI-compatible LLM, with a `deep-translator` + template fallback.
-- **Vertical compositor** — split-screen webcam + gameplay or full-screen blurred-background `9:16` output with safe UTF-8 `drawtext` banner rendering.
-- **Toggleable anti-duplicate fingerprinting** — subtle zoom, colour grade, speed change and exact subtitle time-scaling.
-- **Per-language YouTube channels** — connect `data/token_<lang>.json` OAuth tokens for any language, schedule with `publishAt`, and keep a 5-uploads/day quota guard.
-- **Zero-key verification** — generate a synthetic test clip and exercise the full pipeline without Twitch, LLM or YouTube credentials.
+- **Multi-language Twitch discovery.** Resolves any Twitch game by name, paginates clip results, and filters by ISO 639-1 language because the Twitch clips endpoint has no language parameter.
+- **CPU int8 Whisper transcription.** Runs `faster-whisper` locally on CPU with `compute_type="int8"`. No GPU is required.
+- **Interactive 9:16 crop studio.** Adjusts the webcam region, layout, subtitle typography, and safe zone with a live source and composite preview.
+- **FFmpeg split-screen compositing.** Produces 1080x1920 output with split-screen webcam/gameplay or a full-screen blurred background.
+- **Optional YouTube scheduling.** Connects per-language OAuth channels, uploads with `publishAt`, and enforces a five-upload daily quota per channel.
+- **Zero-key verification.** Renders a synthetic clip through the complete pipeline without Twitch, LLM, or YouTube credentials.
 
-## Multi-Language Workflow
+## Pipeline
 
-1. **Fetch** — choose a language (or All Languages), choose a game, then fetch Twitch clips or paste URLs.
-2. **Style** — crop the webcam region, choose split/blur layout, and tune subtitle styling.
-3. **Render** — render each clip in its native selected language. Optionally enable *Also generate a translated version* and choose a target language.
-4. **Publish** — edit localized metadata per language variant and schedule uploads to the matching YouTube channel.
+```text
+Twitch Helix or public URL
+            |
+            v
+   yt-dlp download
+   workspace/raw/<clip_id>.mp4
+            |
+            v
+   faster-whisper (CPU int8)
+   .ass subtitles + localized metadata
+            |
+            v
+   FFmpeg 9:16 compositor
+   output/<lang>/<clip_id>_<lang>.mp4
+            |
+            +--> optional anti-duplicate fingerprinting
+            |
+            +--> optional YouTube publishAt scheduling
+```
 
-Outputs are written to:
+## Quickstart (Ubuntu / Debian)
+
+1. Install system packages.
+
+   ```bash
+   sudo apt update
+   sudo apt install -y ffmpeg fonts-dejavu-core fonts-noto-cjk xdg-utils
+   ```
+
+2. Create a virtual environment and install Python dependencies.
+
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   pip install -r requirements.txt
+   ```
+
+3. Configure optional credentials.
+
+   ```bash
+   cp .env.example .env
+   $EDITOR .env
+   ```
+
+   Twitch credentials enable clip discovery. LLM credentials enable model-generated metadata and translation. Public Twitch and YouTube URLs work without credentials.
+
+4. Launch the studio.
+
+   ```bash
+   streamlit run app.py
+   ```
+
+## Usage
+
+The workspace is organized into four tabs:
+
+1. **Fetch & Queue** selects a language and game, then imports public URLs or fetches Twitch clips.
+2. **Crop & Style** sets the webcam crop, layout, subtitle styling, and streamer presets.
+3. **Batch Render & Preview** renders selected clips, edits publishing metadata, and schedules uploads.
+4. **Settings & Channels** stores credentials, selects the Whisper model, and connects YouTube channels.
+
+Without Twitch credentials, use **Load Demo Clip** in the first tab to render a synthetic clip immediately.
+
+Outputs are written per language:
 
 ```text
 output/
@@ -33,110 +88,76 @@ output/
 └── ...
 ```
 
-## Installation (Ubuntu / Debian)
-
-```bash
-sudo apt update
-sudo apt install -y ffmpeg fonts-dejavu-core fonts-noto-cjk xdg-utils
-
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-streamlit run app.py
-```
-
-Python 3.10+ is required. The app is CPU-first and does not need a discrete GPU.
-
-## API Setup
-
-### Twitch (clip discovery)
-
-1. Create an application in the [Twitch Developer Console](https://dev.twitch.tv/console/apps).
-2. Copy `.env.example` to `.env` and set:
-   - `TWITCH_CLIENT_ID`
-   - `TWITCH_CLIENT_SECRET`
-
-Twitch clip fetching uses the app-access-token client-credentials flow.
-
-### LLM (native metadata quality + optional translation)
-
-Any OpenAI-compatible endpoint works (Groq, Gemini OpenAI-compatible, local gateways):
-
-```env
-LLM_API_KEY=your_api_key
-LLM_BASE_URL=https://api.groq.com/openai/v1
-LLM_MODEL=llama-3.1-8b-instant
-```
-
-Without an LLM key, ClipForge uses localized templates and `deep-translator` where available. The pipeline never crashes because of an LLM failure.
-
-### YouTube (per-language channels)
-
-1. Enable the **YouTube Data API v3** in Google Cloud Console.
-2. Create an OAuth **Desktop app** client and download it as `data/client_secret.json`.
-3. In **Settings & Channels**, select a language and click **Connect <LANG> channel**.
-4. Repeat for each language niche. Tokens are stored as `data/token_<lang>.json`.
-
-Scheduling uses ISO-8601 `publishAt`, supports configurable spacing and slot indexes, and enforces a hard cap of **5 uploads per language channel per UTC day**.
+Webcam crops are stored in `presets.json`. YouTube OAuth tokens and upload history are stored under `data/`.
 
 ## Configuration
 
-Defaults live in `config.yaml`:
+### Environment variables (`.env`)
 
-```yaml
-default_game: "Grand Theft Auto VI"
-default_language: "en"
-supported_languages: [en, uk, es, de, fr, pl, pt, ru, ja, ko]
+| Variable | Required | Description |
+| --- | --- | --- |
+| `TWITCH_CLIENT_ID` | For Twitch discovery | Client ID from the Twitch Developer Console. |
+| `TWITCH_CLIENT_SECRET` | For Twitch discovery | Client secret for the app access token flow. |
+| `LLM_API_KEY` | No | API key for an OpenAI-compatible endpoint. |
+| `LLM_BASE_URL` | No | OpenAI-compatible base URL. Defaults to `https://api.groq.com/openai/v1`. |
+| `LLM_MODEL` | No | Metadata and translation model name. Defaults to `llama-3.1-8b-instant`. |
 
-width: 1080
-height: 1920
-whisper_model: "small"
-compute_type: "int8"
+Without an LLM key, ShortStack uses localized templates and `deep-translator` where available.
 
-font_family: "DejaVu Sans"
-font_size: 36
-primary_color: "#FFFF00"
-outline_thickness: 2
-margin_v: 220
+### `config.yaml`
 
-anti_duplicate_enabled: true
-anti_duplicate_scale: 1.04
-anti_duplicate_contrast: 1.03
-anti_duplicate_saturation: 1.05
-anti_duplicate_speed: 1.02
-```
+| Key | Default | Description |
+| --- | --- | --- |
+| `default_game` | `Grand Theft Auto VI` | Game used by the fetcher and metadata templates. |
+| `default_language` | `en` | Source language when a clip has no stored language. |
+| `supported_languages` | `[en, uk, es, de, fr, pl, pt, ru, ja, ko]` | Language codes shown in the UI. |
+| `width` / `height` | `1080` / `1920` | Output resolution (9:16). |
+| `whisper_model` | `small` | CPU transcription model: `tiny`, `base`, `small`, or `medium`. |
+| `compute_type` | `int8` | `faster-whisper` compute type. |
+| `font_family` | `DejaVu Sans` | Subtitle font family. |
+| `font_size` | `36` | Subtitle text size at 1080x1920. |
+| `primary_color` | `#FFFF00` | Subtitle fill color. |
+| `outline_thickness` | `2` | Subtitle outline width in pixels. |
+| `margin_v` | `220` | Bottom safe zone in pixels. |
+| `anti_duplicate_enabled` | `true` | Enables subtle zoom, colour grade, and speed changes. |
+| `anti_duplicate_scale` | `1.04` | Fingerprint zoom factor. |
+| `anti_duplicate_contrast` | `1.03` | Fingerprint contrast factor. |
+| `anti_duplicate_saturation` | `1.05` | Fingerprint saturation factor. |
+| `anti_duplicate_speed` | `1.02` | Playback speed factor. Subtitle timestamps are rescaled to match. |
 
-Webcam crop presets live in `presets.json` and can be edited from the **Crop & Style** tab.
+### YouTube OAuth
+
+1. Enable the YouTube Data API v3 in Google Cloud Console.
+2. Create an OAuth Desktop app client and save it as `data/client_secret.json`.
+3. Open **Settings & Channels**, select a language, and connect the channel.
+4. Repeat for each language. Tokens are stored as `data/token_<lang>.json`.
+
+Scheduling uses ISO 8601 `publishAt` timestamps with configurable spacing and a hard limit of five uploads per language channel per UTC day.
 
 ## Architecture
 
-```text
-app.py                  Streamlit studio UI and pipeline orchestration
-src/languages.py        ISO 639-1 normalization, names, badges, supported lists
-src/fetcher.py          Twitch Helix game lookup, paginated language filtering, yt-dlp downloads
-src/transcriber.py      faster-whisper, ASS subtitles, native metadata, optional translation
-src/renderer.py         FFmpeg 9:16 compositor, UTF-8 textfile banners, fingerprinting toggle
-src/uploader.py         YouTube Data API v3 uploads, dynamic per-language OAuth tokens
-tests/smoke_test.py     Zero-key end-to-end EN + UK verification
-```
-
-### Anti-duplicate fingerprinting
-
-When enabled, each rendered clip receives a subtle `1.04x` zoom, a micro colour grade, and `1.02x` playback speed. Video PTS uses `(1 / speed)`, audio uses `atempo=speed`, and ASS dialogue timestamps are multiplied by the exact reciprocal `1 / speed` so subtitles remain in sync. Disable it in `config.yaml` or from the render/settings controls.
+| Path | Responsibility |
+| --- | --- |
+| `app.py` | Streamlit studio UI and pipeline orchestration. |
+| `src/languages.py` | ISO 639-1 normalization, names, badges, and supported language lists. |
+| `src/fetcher.py` | Twitch Helix game lookup, paginated language filtering, and yt-dlp downloads. |
+| `src/transcriber.py` | faster-whisper, ASS subtitles, localized metadata, and optional translation. |
+| `src/renderer.py` | FFmpeg 9:16 compositor, UTF-8 textfile banners, and fingerprinting. |
+| `src/uploader.py` | YouTube Data API v3 uploads with per-language OAuth tokens. |
+| `tests/smoke_test.py` | Zero-key end-to-end English and Ukrainian verification. |
 
 ## Verification
 
 ```bash
-python3 -m py_compile app.py src/*.py tests/smoke_test.py
-ruff check .
+.venv/bin/python -m py_compile app.py src/*.py tests/smoke_test.py
+.venv/bin/ruff check .
 
-# Native EN + UK synthetic pipeline, no API keys required
+# Native EN and UK synthetic pipeline, no API keys required
 .venv/bin/python tests/smoke_test.py --model tiny
 ```
 
-The smoke test generates a five-second synthetic clip, runs whisper, builds native metadata/subtitles, renders `output/en/synth_test_en.mp4` and `output/uk/synth_test_uk.mp4`, and verifies H.264/AAC `1080x1920` output, distinct fingerprints and localized metadata.
+The smoke test generates a five-second clip, runs Whisper, builds native metadata and subtitles, renders `output/en/synth_test_en.mp4` and `output/uk/synth_test_uk.mp4`, and verifies H.264/AAC 1080x1920 output, distinct fingerprints, and localized metadata.
 
 ## License
 
-Released under the MIT License. See [`LICENSE`](LICENSE).
+Released under the MIT License. Copyright (c) 2026 ShortStack contributors. See [`LICENSE`](LICENSE).

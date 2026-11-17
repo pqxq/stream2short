@@ -148,7 +148,7 @@ def main() -> int:
     for key in ("LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL"):
         os.environ.pop(key, None)
 
-    print("ClipForge Studio synthetic smoke test")
+    print("ShortStack synthetic smoke test")
     print(f"Project: {PROJECT_ROOT}")
     print(f"Whisper model: {args.model}")
     print(f"Languages: {', '.join(code.upper() for code in languages)}")

@@ -1,6 +1,6 @@
-"""ClipForge Studio — open-source multi-game, multi-language clip studio.
+"""ShortStack - open-source multi-game, multi-language clip studio.
 
-Run with ``streamlit run app.py``.  Importing this module has no Streamlit side
+Run with ``streamlit run app.py``. Importing this module has no Streamlit side
 effects, so the synthetic smoke test can reuse the pipeline helpers directly.
 """
 
@@ -457,28 +457,29 @@ def _cached_previews(
 
 
 def render_sidebar_health() -> None:
-    st.sidebar.title("ClipForge Studio")
-    st.sidebar.caption("Open-source multi-game vertical clip studio")
+    st.sidebar.title("ShortStack")
+    st.sidebar.caption("Open-source vertical clip studio")
     st.sidebar.subheader("System health")
     if HAS_FFMPEG:
         st.sidebar.success("FFmpeg / ffprobe: OK")
     else:
-        st.sidebar.error("FFmpeg / ffprobe: missing")
+        st.sidebar.error("FFmpeg / ffprobe: missing. Install with: sudo apt install ffmpeg")
     model_name = load_config()["whisper_model"]
     if WHISPER_AVAILABLE:
         st.sidebar.success(f"Whisper ({model_name}, int8): ready")
     else:
-        st.sidebar.error("faster-whisper: not installed")
+        st.sidebar.error("faster-whisper: not installed. Run: pip install -r requirements.txt")
     st.sidebar.metric("Processed clips", len(load_processed_clips()))
     active_language = _active_pipeline_language()
     st.sidebar.caption(
         f"Pipeline language: {language_badge(active_language)} {language_name(active_language)}"
     )
     st.sidebar.divider()
-    st.sidebar.subheader("Zero-key verification")
-    if st.sidebar.button("Generate Synthetic Test Clip", width="stretch"):
+    st.sidebar.subheader("Test without API keys")
+    st.sidebar.caption("Renders a five-second synthetic clip through the full pipeline.")
+    if st.sidebar.button("Run Synthetic Test Render", width="stretch"):
         if not HAS_FFMPEG:
-            st.sidebar.error("Install ffmpeg first.")
+            st.sidebar.error("FFmpeg is required before running the test render.")
         else:
             with st.sidebar.status("Running synthetic pipeline...", expanded=True) as status:
                 try:
@@ -492,22 +493,87 @@ def render_sidebar_health() -> None:
                     )
                 except (RuntimeError, FileNotFoundError, ValueError, OSError) as exc:
                     status.update(label="Synthetic pipeline failed", state="error")
-                    st.sidebar.error(str(exc))
+                    st.sidebar.error(
+                        f"{exc}. Verify FFmpeg is installed and workspace/ is writable."
+                    )
+
+
+def _load_demo_clip() -> None:
+    if not HAS_FFMPEG:
+        st.error("FFmpeg is required for the demo. Install it with: sudo apt install ffmpeg")
+        return
+    with st.status("Generating demo clip...", expanded=True) as status:
+        try:
+            result = generate_synthetic_test_clip(
+                progress=status.write,
+                language=_active_pipeline_language(),
+                clip_id="demo_clip",
+            )
+            st.session_state.render_results["demo_clip"] = result
+            queue = list(st.session_state.get("clip_queue", []))
+            if not any(str(clip.get("id")) == "demo_clip" for clip in queue):
+                queue.append(
+                    {
+                        "id": "demo_clip",
+                        "url": "",
+                        "title": "Synthetic demo clip",
+                        "streamer": "demo",
+                        "thumbnail": "",
+                        "views": 0,
+                        "duration": 5,
+                        "source": "demo",
+                        "language": _active_pipeline_language(),
+                        "game": str(load_config().get("default_game") or ""),
+                    }
+                )
+                st.session_state.clip_queue = queue
+            status.update(label="Demo clip ready", state="complete")
+        except (RuntimeError, FileNotFoundError, ValueError, OSError) as exc:
+            status.update(label="Demo clip failed", state="error")
+            st.error(
+                f"Demo generation failed: {exc}. Check FFmpeg and write access to workspace/."
+            )
+            return
+    st.success(
+        "Demo clip rendered to workspace/raw/demo_clip.mp4. "
+        "Open Crop & Style to inspect the crop, or Batch Render & Preview to review the output."
+    )
 
 
 def tab_fetch_and_queue() -> None:
     st.header("Fetch & Queue")
-    st.caption("Step 1 chooses the language, Step 2 chooses the game, then fetch or paste URLs.")
+    st.caption("Choose a language and game, then fetch Twitch clips or paste public URLs.")
+    twitch_ready = bool(os.getenv("TWITCH_CLIENT_ID") and os.getenv("TWITCH_CLIENT_SECRET"))
+    if not twitch_ready:
+        with st.container(border=True):
+            st.markdown("**Start without API keys**")
+            st.write(
+                "Twitch discovery needs credentials, but the studio works immediately "
+                "with any public clip URL."
+            )
+            st.markdown(
+                "- **Use a public URL.** Paste a Twitch clip or YouTube link under Manual "
+                "URLs and add it to the queue.\n"
+                "- **Load the demo.** Generate a five-second synthetic clip and run the "
+                "full transcription and render pipeline."
+            )
+            if st.button("Load Demo Clip", key="load_demo_clip"):
+                _load_demo_clip()
+        st.caption(
+            "To enable Twitch discovery, save TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET "
+            "in Settings & Channels."
+        )
+
     language_col, game_col = st.columns(2)
     with language_col:
-        st.subheader("Step 1 · Language")
+        st.subheader("Step 1: Language")
         options = [ALL_LANGUAGES, *_supported_languages(), CUSTOM_LANGUAGE]
 
         def _format_language(value: str) -> str:
             if value == ALL_LANGUAGES:
                 return "All languages"
             if value == CUSTOM_LANGUAGE:
-                return "Custom ISO code…"
+                return "Custom ISO code..."
             return _language_label(value)
 
         choice = st.selectbox(
@@ -525,7 +591,7 @@ def tab_fetch_and_queue() -> None:
         if choice == CUSTOM_LANGUAGE:
             selected_language = normalize_language(custom_code)
             if not selected_language:
-                st.warning("Enter a valid 2–3 letter language code, for example 'uk'.")
+                st.warning("Enter a valid 2-3 letter language code, for example 'uk'.")
         elif choice != ALL_LANGUAGES:
             selected_language = normalize_language(choice)
         st.session_state.pipeline_language = (
@@ -533,7 +599,7 @@ def tab_fetch_and_queue() -> None:
         )
 
     with game_col:
-        st.subheader("Step 2 · Game")
+        st.subheader("Step 2: Game")
         preset_options = _game_preset_options()
         if st.session_state.get("game_preset_control") not in preset_options:
             st.session_state.game_preset_control = preset_options[0]
@@ -552,14 +618,26 @@ def tab_fetch_and_queue() -> None:
             "Twitch clip or YouTube URLs (one per line)",
             height=140,
             key="manual_urls",
+            help=(
+                "Public Twitch clips, Twitch VODs and YouTube videos are downloaded "
+                "with yt-dlp. No API keys are required."
+            ),
+            placeholder=(
+                "https://clips.twitch.tv/ExampleClip\n"
+                "https://www.youtube.com/watch?v=Example"
+            ),
         )
         if st.button("Add URLs to Queue", width="stretch"):
             added = 0
+            skipped = 0
             queue = list(st.session_state.clip_queue)
             known = {str(clip.get("id")) for clip in queue}
             for line in urls_text.splitlines():
                 url = line.strip()
-                if not url or not url.startswith(("http://", "https://")):
+                if not url:
+                    continue
+                if not url.startswith(("http://", "https://")):
+                    skipped += 1
                     continue
                 clip_id = clip_id_from_url(url)
                 if clip_id in known:
@@ -583,26 +661,54 @@ def tab_fetch_and_queue() -> None:
             st.session_state.clip_queue = queue
             if added:
                 st.success(f"Added {added} URL(s) to the queue.")
-            else:
-                st.warning("No new valid URLs found.")
+            if skipped:
+                st.error(
+                    f"{skipped} line(s) were skipped. Each URL must start with "
+                    "http:// or https://."
+                )
+            if not added and not skipped:
+                st.warning(
+                    "No new URLs were added. The queue may already contain these clips."
+                )
 
     with twitch_col:
         st.subheader("Twitch auto-fetcher")
-        timeframe = st.selectbox("Timeframe", ["24h", "7d", "30d"], index=1, key="timeframe")
+        timeframe = st.selectbox(
+            "Timeframe",
+            ["24h", "7d", "30d"],
+            index=1,
+            key="timeframe",
+            help="Twitch popularity window used for clip discovery.",
+        )
         limit = st.number_input(
-            "Clip limit", min_value=1, max_value=50, value=10, key="clip_limit"
+            "Clip limit",
+            min_value=1,
+            max_value=50,
+            value=10,
+            key="clip_limit",
+            help="Maximum clips to add. The fetcher scans up to 1,000 candidates per request.",
         )
         if st.button("Fetch Top Clips", width="stretch"):
-            if not (os.getenv("TWITCH_CLIENT_ID") and os.getenv("TWITCH_CLIENT_SECRET")):
-                st.warning("Set TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET in Settings first.")
+            if not twitch_ready:
+                st.warning(
+                    "Twitch discovery needs credentials. Save TWITCH_CLIENT_ID and "
+                    "TWITCH_CLIENT_SECRET in Settings & Channels, or paste public URLs "
+                    "under Manual URLs."
+                )
             else:
-                with st.spinner("Querying Twitch Helix and filtering by language..."):
-                    clips = fetch_twitch_clips(
-                        game_name=game_name,
-                        first=int(limit),
-                        period=str(timeframe),
-                        language=selected_language,
+                try:
+                    with st.spinner("Querying Twitch Helix and filtering by language..."):
+                        clips = fetch_twitch_clips(
+                            game_name=game_name,
+                            first=int(limit),
+                            period=str(timeframe),
+                            language=selected_language,
+                        )
+                except (RuntimeError, ValueError, OSError) as exc:
+                    st.error(
+                        f"Twitch fetch failed: {exc}. Verify the game name and try again."
                     )
+                    clips = []
                 queue = list(st.session_state.clip_queue)
                 known = {str(clip.get("id")) for clip in queue}
                 added = 0
@@ -617,12 +723,15 @@ def tab_fetch_and_queue() -> None:
                     st.success(f"Added {added} Twitch clip(s).")
                     if selected_language and added < int(limit):
                         st.info(
-                            f"Twitch only returned {added} clips in "
+                            f"Twitch returned {added} clips in "
                             f"{language_badge(selected_language)} after scanning up to "
-                            "1000 candidates."
+                            "1,000 candidates."
                         )
                 else:
-                    st.info("No new clips returned. Check credentials, game name or language.")
+                    st.info(
+                        "No new clips matched. Confirm the game name matches Twitch, "
+                        "widen the timeframe, or set the language to All languages."
+                    )
 
     st.divider()
     st.subheader("Interactive clip queue")
@@ -719,18 +828,51 @@ def tab_crop_style_studio() -> None:
             st.session_state[f"{axis}_{clip_id}"] = float(preset[axis])
         st.session_state["preview_signature"] = signature
 
-    st.subheader("Webcam crop (normalized 0.0 – 1.0)")
-    x_col, y_col, w_col, h_col = st.columns(4)
-    with x_col:
-        cam_x = st.slider("cam_x", 0.0, 1.0, step=0.01, key=f"cam_x_{clip_id}")
-    with y_col:
-        cam_y = st.slider("cam_y", 0.0, 1.0, step=0.01, key=f"cam_y_{clip_id}")
-    with w_col:
-        cam_w = st.slider("cam_w", 0.01, 1.0, step=0.01, key=f"cam_w_{clip_id}")
-    with h_col:
-        cam_h = st.slider("cam_h", 0.01, 1.0, step=0.01, key=f"cam_h_{clip_id}")
-    if cam_x + cam_w > 1.0 or cam_y + cam_h > 1.0:
-        st.warning("The webcam crop extends past the source frame; FFmpeg will clamp it.")
+    with st.container(border=True):
+        st.subheader("Webcam crop")
+        st.caption("Positions and sizes are normalized to the source frame (0.0-1.0).")
+        x_col, y_col, w_col, h_col = st.columns(4)
+        with x_col:
+            cam_x = st.slider(
+                "Horizontal Position",
+                0.0,
+                1.0,
+                step=0.01,
+                key=f"cam_x_{clip_id}",
+                help="Left edge of the webcam region as a fraction of the source width.",
+            )
+        with y_col:
+            cam_y = st.slider(
+                "Vertical Position",
+                0.0,
+                1.0,
+                step=0.01,
+                key=f"cam_y_{clip_id}",
+                help="Top edge of the webcam region as a fraction of the source height.",
+            )
+        with w_col:
+            cam_w = st.slider(
+                "Crop Width",
+                0.01,
+                1.0,
+                step=0.01,
+                key=f"cam_w_{clip_id}",
+                help="Width of the webcam region as a fraction of the source width.",
+            )
+        with h_col:
+            cam_h = st.slider(
+                "Crop Height",
+                0.01,
+                1.0,
+                step=0.01,
+                key=f"cam_h_{clip_id}",
+                help="Height of the webcam region as a fraction of the source height.",
+            )
+        if cam_x + cam_w > 1.0 or cam_y + cam_h > 1.0:
+            st.warning(
+                "The webcam crop extends past the source frame. Reduce Crop Width or "
+                "Crop Height, or move the crop inward. FFmpeg will clamp the region."
+            )
 
     layout_mode = st.radio(
         "Layout mode",
@@ -738,22 +880,51 @@ def tab_crop_style_studio() -> None:
         format_func=lambda value: (
             "Split-Screen (Webcam + Gameplay)"
             if value == "split"
-            else "Full-Screen 9:16 with Blurred BG"
+            else "Full-Screen 9:16 with Blurred Background"
         ),
         horizontal=True,
         key="layout_mode",
+        help="Split-screen places the webcam above gameplay. Blur mode fills the frame with gameplay.",
     )
 
-    with st.expander("Subtitle & hook styling", expanded=True):
+    with st.expander("Advanced Styling & Output Options", expanded=False):
+        st.caption(
+            "Subtitle typography and safe-zone controls. The defaults suit most clips."
+        )
         style_cols = st.columns(4)
         with style_cols[0]:
-            st.slider("Font size", 24, 72, key="font_size_control")
+            st.slider(
+                "Font size",
+                24,
+                72,
+                key="font_size_control",
+                help="Subtitle text size in pixels at 1080x1920 output resolution.",
+            )
         with style_cols[1]:
-            st.color_picker("Primary color", key="primary_color_control")
+            st.color_picker(
+                "Primary color",
+                key="primary_color_control",
+                help="Subtitle fill color. The outline keeps text readable on any footage.",
+            )
         with style_cols[2]:
-            st.slider("Outline thickness", 0, 6, key="outline_control")
+            st.slider(
+                "Font outline thickness",
+                0,
+                6,
+                key="outline_control",
+                help="Black outline width in pixels. Increase for busy gameplay backgrounds.",
+            )
         with style_cols[3]:
-            st.slider("Bottom margin (MarginV)", 100, 400, key="margin_v_control")
+            st.slider(
+                "Bottom Safe-Zone (px)",
+                100,
+                400,
+                key="margin_v_control",
+                help=(
+                    "Distance from the bottom edge to the subtitle baseline. Increase "
+                    "to clear player controls and platform UI."
+                ),
+            )
 
     config = _style_config()
     cam_box = (cam_x, cam_y, cam_w, cam_h)
@@ -801,8 +972,17 @@ def tab_crop_style_studio() -> None:
         )
     with save_cols[1]:
         if st.button("Save Preset for Streamer", width="stretch"):
-            save_preset(preset_streamer, cam_x, cam_y, cam_w, cam_h)
-            st.success(f"Preset '{preset_streamer}' saved to presets.json.")
+            streamer_name = preset_streamer.strip()
+            if not streamer_name:
+                st.error("Enter a streamer name before saving the crop preset.")
+            else:
+                try:
+                    with st.spinner("Saving crop preset..."):
+                        save_preset(streamer_name, cam_x, cam_y, cam_w, cam_h)
+                except OSError as exc:
+                    st.error(f"Could not save the preset: {exc}")
+                else:
+                    st.success(f"Preset '{streamer_name}' saved to presets.json.")
 
 
 def _render_variant_panel(
@@ -827,28 +1007,30 @@ def _render_variant_panel(
     else:
         st.info(f"{lang_code.upper()} render is not available yet.")
 
-    hook_value = st.text_input(
-        "Hook Banner Text",
-        value=str(metadata.get("hook") or ""),
-        key=f"hook_{clip_id}_{lang_code}",
-    )
-    title_value = st.text_input(
-        "Video Title",
-        value=str(metadata.get("title") or ""),
-        key=f"title_{clip_id}_{lang_code}",
-    )
-    description_value = st.text_area(
-        "Description & Hashtags",
-        value=str(metadata.get("description") or ""),
-        height=130,
-        key=f"description_{clip_id}_{lang_code}",
-    )
-    comment_value = st.text_area(
-        "Pinned Comment CTA",
-        value=str(metadata.get("cta") or ""),
-        height=90,
-        key=f"comment_{clip_id}_{lang_code}",
-    )
+    with st.expander("Publishing metadata & custom hooks", expanded=False):
+        hook_value = st.text_input(
+            "Hook Banner Text",
+            value=str(metadata.get("hook") or ""),
+            key=f"hook_{clip_id}_{lang_code}",
+            help="Short localized hook rendered above the subtitle.",
+        )
+        title_value = st.text_input(
+            "Video Title",
+            value=str(metadata.get("title") or ""),
+            key=f"title_{clip_id}_{lang_code}",
+        )
+        description_value = st.text_area(
+            "Description & Hashtags",
+            value=str(metadata.get("description") or ""),
+            height=130,
+            key=f"description_{clip_id}_{lang_code}",
+        )
+        comment_value = st.text_area(
+            "Pinned Comment CTA",
+            value=str(metadata.get("cta") or ""),
+            height=90,
+            key=f"comment_{clip_id}_{lang_code}",
+        )
 
     action_cols = st.columns(3)
     if action_cols[0].button("Re-render Hook Text", key=f"rerender_{clip_id}_{lang_code}"):
@@ -921,7 +1103,7 @@ def _render_variant_panel(
 
 def render_clip_gallery(clip_id: str, result: dict[str, Any]) -> None:
     game = str(result.get("game_name") or "")
-    with st.expander(f"Clip {clip_id}" + (f" · {game}" if game else ""), expanded=True):
+    with st.expander(f"Clip {clip_id}" + (f" - {game}" if game else ""), expanded=True):
         variants = result.get("variants") or {}
         if not variants:
             st.info("No language variants are available for this clip yet.")
@@ -954,42 +1136,47 @@ def tab_batch_render() -> None:
     config = load_config()
     default_language = normalize_language(config.get("default_language")) or "en"
     fallback_index = codes.index(default_language) if default_language in codes else 0
-    control_cols = st.columns(3)
-    with control_cols[0]:
-        fallback_language = st.selectbox(
-            "Fallback language for clips without metadata",
-            codes,
-            index=fallback_index,
-            format_func=_language_label,
-            key="render_fallback_language",
-        )
-    with control_cols[1]:
-        translate_enabled = st.checkbox(
-            "Also generate a translated version", value=False, key="render_translate"
-        )
-    with control_cols[2]:
-        target_language = st.selectbox(
-            "Translation target",
-            codes,
-            index=0,
-            format_func=_language_label,
-            key="render_target_language",
-            disabled=not translate_enabled,
-        )
     st.session_state.setdefault(
         "render_uniqueness", bool(config.get("anti_duplicate_enabled", True))
     )
-    apply_uniqueness = st.checkbox(
-        "Apply anti-duplicate fingerprinting",
-        key="render_uniqueness",
-        help="Subtle zoom, colour grade and 1.02x speed with resynced subtitles.",
-    )
     layout_mode = st.session_state.get("layout_mode", "split")
-    st.caption(
-        "Layout: "
-        + ("Split-Screen" if layout_mode == "split" else "Full-Screen blurred")
-        + " | Native language first, translation optional"
-    )
+    layout_label = "Split-Screen" if layout_mode == "split" else "Full-Screen blurred"
+    st.caption(f"Layout: {layout_label}. Clips render in their native language first.")
+
+    with st.expander("Advanced Styling & Output Options", expanded=False):
+        control_cols = st.columns(3)
+        with control_cols[0]:
+            fallback_language = st.selectbox(
+                "Fallback language",
+                codes,
+                index=fallback_index,
+                format_func=_language_label,
+                key="render_fallback_language",
+                help="Used only when a clip has no stored source language.",
+            )
+        with control_cols[1]:
+            translate_enabled = st.checkbox(
+                "Also generate a translated version",
+                value=False,
+                key="render_translate",
+            )
+        with control_cols[2]:
+            target_language = st.selectbox(
+                "Translation target",
+                codes,
+                index=0,
+                format_func=_language_label,
+                key="render_target_language",
+                disabled=not translate_enabled,
+            )
+        apply_uniqueness = st.checkbox(
+            "Apply anti-duplicate fingerprinting",
+            key="render_uniqueness",
+            help=(
+                "Applies a subtle zoom, colour grade and 1.02x speed change with "
+                "resynced subtitles."
+            ),
+        )
 
     if st.button("Render Selected Clips", type="primary", width="stretch"):
         if not selected:
@@ -1050,27 +1237,36 @@ def tab_settings_channels() -> None:
     with credentials_col:
         st.subheader("Credentials (.env)")
         twitch_id = st.text_input(
-            "TWITCH_CLIENT_ID", value=os.getenv("TWITCH_CLIENT_ID", ""), key="env_twitch_id"
+            "Twitch Client ID",
+            value=os.getenv("TWITCH_CLIENT_ID", ""),
+            key="env_twitch_id",
+            help="Stored as TWITCH_CLIENT_ID in .env. Required for Twitch clip discovery.",
         )
         twitch_secret = st.text_input(
-            "TWITCH_CLIENT_SECRET",
+            "Twitch Client Secret",
             value=os.getenv("TWITCH_CLIENT_SECRET", ""),
             type="password",
             key="env_twitch_secret",
+            help="Stored as TWITCH_CLIENT_SECRET in .env. Required for Twitch clip discovery.",
         )
         llm_key = st.text_input(
-            "LLM_API_KEY",
+            "LLM API Key",
             value=os.getenv("LLM_API_KEY", ""),
             type="password",
             key="env_llm_key",
+            help="Stored as LLM_API_KEY. Optional; enables LLM metadata and translation.",
         )
         llm_url = st.text_input(
-            "LLM_BASE_URL",
+            "LLM Base URL",
             value=os.getenv("LLM_BASE_URL", "https://api.groq.com/openai/v1"),
             key="env_llm_url",
+            help="Stored as LLM_BASE_URL. Must be an OpenAI-compatible endpoint.",
         )
         llm_model = st.text_input(
-            "LLM_MODEL", value=os.getenv("LLM_MODEL", "llama-3.1-8b-instant"), key="env_llm_model"
+            "LLM Model",
+            value=os.getenv("LLM_MODEL", "llama-3.1-8b-instant"),
+            key="env_llm_model",
+            help="Stored as LLM_MODEL. Defaults to llama-3.1-8b-instant.",
         )
         if st.button("Save .env", width="stretch"):
             _save_env_values(
@@ -1082,7 +1278,13 @@ def tab_settings_channels() -> None:
                     "LLM_MODEL": llm_model,
                 }
             )
-            st.success(".env saved. New values are active immediately.")
+            if bool(twitch_id.strip()) != bool(twitch_secret.strip()):
+                st.warning(
+                    ".env saved, but Twitch discovery needs both a Client ID and a "
+                    "Client Secret."
+                )
+            else:
+                st.success(".env saved. New values are active immediately.")
 
     with model_col:
         st.subheader("Whisper model")
@@ -1096,6 +1298,7 @@ def tab_settings_channels() -> None:
             model_options,
             index=model_options.index(current_model),
             key="settings_whisper_model",
+            help="Larger models improve accuracy at the cost of CPU time and memory.",
         )
         st.caption("int8 compute type is used for CPU-first execution.")
         if st.button("Save Whisper Model", width="stretch"):
@@ -1122,7 +1325,7 @@ def tab_settings_channels() -> None:
             "Channel language",
             [*codes, CUSTOM_LANGUAGE],
             format_func=lambda value: (
-                "Custom ISO code…" if value == CUSTOM_LANGUAGE else _language_label(value)
+                "Custom ISO code..." if value == CUSTOM_LANGUAGE else _language_label(value)
             ),
             key="settings_channel_language",
         )
@@ -1208,7 +1411,7 @@ def tab_settings_channels() -> None:
 
 def main() -> None:
     st.set_page_config(
-        page_title="ClipForge Studio",
+        page_title="ShortStack",
         layout="wide",
         initial_sidebar_state="expanded",
     )
