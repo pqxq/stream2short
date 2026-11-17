@@ -1,23 +1,26 @@
-# AGENT.md — `gta6-clip-factory`
+# AGENT.md — ClipForge Studio
 
 ## 1. Project Overview
-`gta6-clip-factory` is a production-ready, dark-mode **Streamlit Web UI** application for Linux (Ubuntu/Debian) that automates turning viral gaming clips (Twitch & YouTube streams of *Grand Theft Auto VI*) into vertical `9:16` (`1080x1920`) YouTube Shorts and TikToks.
+ClipForge Studio is an open-source, dark-mode **Streamlit** studio for Linux (Ubuntu/Debian) that turns gaming clips from any Twitch/YouTube source into vertical `9:16` (`1080x1920`) Shorts/TikToks for **any supported language niche**.
 
-For every source clip, the pipeline:
-1. Fetches clip metadata (Twitch Helix API or manual URLs) and downloads raw `.mp4` files via `yt-dlp`.
-2. Transcribes speech locally on CPU via `faster-whisper` (`int8`) and generates `.ass` subtitles.
-3. Translates subtitles to idiomatic Russian and generates viral hook banners via an OpenAI-compatible LLM endpoint (Groq/Gemini free tier) with automatic `deep-translator` fallback.
-4. Composites vertical `9:16` split-screen (Webcam + Gameplay) or full-screen blurred-background videos via `ffmpeg`, outputting two uniquely fingerprinted versions per clip: English (`EN`) and Russian (`RU`).
-5. Previews both outputs side-by-side and optionally schedules uploads to separate EN/RU YouTube channels via YouTube Data API v3.
+The pipeline is language-first and game-agnostic:
+1. Resolve a game dynamically via Twitch Helix `/helix/games` and fetch clips with client-side language filtering.
+2. Download raw media with `yt-dlp` and keep a deduplicated processed-clip index.
+3. Transcribe locally with `faster-whisper` (`int8`, CPU-first) in the clip's selected language (native mode).
+4. Generate `.ass` subtitles plus a native-language hook banner, title, description/hashtags and pinned-comment CTA.
+5. Optionally translate subtitles and metadata into a second target language via an OpenAI-compatible LLM, with a `deep-translator` fallback.
+6. Composite split-screen (webcam + gameplay) or blurred-background `9:16` video with `ffmpeg`.
+7. Optionally apply anti-duplicate fingerprinting and schedule uploads to per-language YouTube channels.
+
+No game, language pair, or channel count is hardcoded. Defaults come from `config.yaml`.
 
 ---
 
 ## 2. Environment & System Constraints
 - **Target OS:** Linux (Ubuntu / Debian).
-- **System Dependencies:** `ffmpeg`, `fonts-dejavu-core` (or `fonts-liberation`), `xdg-utils` (`xdg-open`).
-  - Default Linux font path for FFmpeg/ASS: `/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf` (font family `DejaVu Sans`).
-- **Python Version:** `3.10+`
-- **Hardware Target:** CPU-first execution (`faster-whisper` with `compute_type="int8"`, default model `"small"`). Must run smoothly without a discrete GPU.
+- **System Dependencies:** `ffmpeg`, `fonts-dejavu-core` (or `fonts-liberation`), optional `fonts-noto-cjk` for Japanese/Korean, and `xdg-utils` (`xdg-open`).
+- **Python Version:** `3.10+`.
+- **Hardware Target:** CPU-first (`faster-whisper` `compute_type="int8"`, default model `"small"`).
 - **Coding Standard:** **ZERO `# TODO` stubs, mock functions, or placeholders.** Every file must contain complete, runnable, error-handled production code.
 
 ---
@@ -25,28 +28,29 @@ For every source clip, the pipeline:
 ## 3. Repository & Runtime Directory Structure
 
 ```text
-gta6-clip-factory/
+clipforge-studio/
 ├── AGENT.md               # Project rules & architecture guide for AI coding agents
 ├── .streamlit/
 │   └── config.toml        # Dark theme configuration & server.maxUploadSize
-├── app.py                 # Main Streamlit GUI application (Sidebar + 4-tab studio)
-├── config.yaml            # Default settings (1080x1920, whisper model, uniqueness params, margins)
+├── app.py                 # Main Streamlit studio (Sidebar + 4 tabs)
+├── config.yaml            # default_game/default_language/supported_languages/style/uniqueness
 ├── presets.json           # Streamer webcam crop coordinates {streamer: {x, y, w, h}} + "default"
-├── .env.example           # Template for TWITCH_*, LLM_*, and model env vars
+├── .env.example           # Template for TWITCH_*, LLM_*, model env vars
 ├── requirements.txt       # Pinned compatible Python dependencies
-├── README.md              # Setup instructions including `sudo apt install ffmpeg fonts-dejavu-core`
+├── README.md              # Setup, API configuration and architecture overview
 ├── src/
 │   ├── __init__.py
-│   ├── fetcher.py         # Twitch Helix API top-clips fetcher + yt-dlp downloader + JSON deduplication
-│   ├── transcriber.py     # faster-whisper -> .ass generator + EN->RU translation & viral hooks
-│   ├── renderer.py        # FFmpeg frame extractor, 9:16 compositor & EN/RU anti-duplicate filters
-│   └── uploader.py        # YouTube Data API v3 scheduled uploader (`publishAt` spacing & quota guard)
-├── data/                  # [Runtime] processed_clips.json, token_en.json, token_ru.json
-├── workspace/             # [Runtime] raw/<clip_id>.mp4, temp/ (frames, .ass, hook .txt files)
-└── output/                # [Runtime] en/<clip_id>_en.mp4, ru/<clip_id>_ru.mp4
+│   ├── languages.py       # ISO 639-1 normalization, names, badges, supported lists
+│   ├── fetcher.py         # Twitch Helix game lookup + paginated language-first clip fetcher + yt-dlp
+│   ├── transcriber.py     # faster-whisper + ASS + native metadata + optional translation
+│   ├── renderer.py        # FFmpeg 9:16 compositor + toggleable anti-duplicate fingerprinting
+│   └── uploader.py        # YouTube Data API v3 uploader with dynamic per-language tokens
+├── data/                  # [Runtime] processed_clips.json, token_<lang>.json, upload_history.json
+├── workspace/             # [Runtime] raw/<clip_id>.mp4, temp/ (audio, .ass, hook .txt, localization JSON)
+└── output/                # [Runtime] <lang>/<clip_id>_<lang>.mp4
 ```
 
-*Note:* Ensure all runtime directories (`data/`, `workspace/raw/`, `workspace/temp/`, `output/en/`, `output/ru/`) are created programmatically on startup via `Path(...).mkdir(parents=True, exist_ok=True)`.
+Runtime directories are created programmatically on startup via `Path(...).mkdir(parents=True, exist_ok=True)`.
 
 ---
 
@@ -54,15 +58,21 @@ gta6-clip-factory/
 
 ```bash
 # 1. Install OS dependencies (Ubuntu/Debian)
-sudo apt update && sudo apt install -y ffmpeg fonts-dejavu-core
+sudo apt update && sudo apt install -y ffmpeg fonts-dejavu-core fonts-noto-cjk
 
 # 2. Install Python dependencies
 pip install -r requirements.txt
 
-# 3. Syntax & import verification (REQUIRED after any code change)
-python3 -m py_compile app.py src/*.py
+# 3. Syntax verification (REQUIRED after any code change)
+python3 -m py_compile app.py src/*.py tests/smoke_test.py
 
-# 4. Launch Streamlit application
+# 4. Lint (REQUIRED after any code change)
+ruff check .
+
+# 5. Zero-key end-to-end smoke test (native EN + UK)
+.venv/bin/python tests/smoke_test.py --model tiny
+
+# 6. Launch Streamlit
 streamlit run app.py
 ```
 
@@ -71,93 +81,99 @@ streamlit run app.py
 ## 5. Non-Negotiable Backend Rules (`src/`)
 
 ### Rule 1: FFmpeg Safe UTF-8 Text Rendering (`src/renderer.py`)
-- **NEVER** pass dynamic hook banner strings inline inside `-vf drawtext=text='...'`. Cyrillic characters, apostrophes, colons, or quotes will break FFmpeg filtergraph parsing.
-- **ALWAYS** write the hook text to a temporary UTF-8 file (e.g., `/tmp/hook_<clip_id>_<lang>.txt` or `workspace/temp/hook_<clip_id>_<lang>.txt`) and pass `textfile=<escaped_path>:fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf` to `drawtext`.
+- **NEVER** pass dynamic hook banner strings inline inside `-vf drawtext=text='...'`.
+- **ALWAYS** write hook text to a temporary UTF-8 file and pass `textfile=<escaped_path>:fontfile=<escaped_font_path>:expansion=none` to `drawtext`.
+- Use `_filter_path()` for escaping paths and quote filter inputs.
+- Japanese/Korean renders should use a Noto CJK font when available; otherwise fall back to DejaVu/Liberation.
 
-### Rule 2: Anti-Duplicate Fingerprinting (`src/renderer.py`)
-Every clip must produce two visually/acoustically distinct perceptual hashes while preserving subtitle sync:
-- **English (`output/en/<clip_id>_en.mp4`):**
-  - Scale: `1.0x`
-  - Playback speed: `1.0x` (standard PTS & audio tempo)
-  - Subtitles: Original `.ass` timestamps (`1.0x`)
-- **Russian (`output/ru/<clip_id>_ru.mp4`):**
-  - Subtle zoom: `1.04x` (scale up by 1.04 and center-crop back to `1080x1920`)
-  - Micro color grade: `eq=contrast=1.03:saturation=1.05`
-  - Playback speed: `1.02x` (`setpts=0.98*PTS` on video, `atempo=1.02` on audio)
-  - Subtitle sync: Multiply all `.ass` dialogue start and end timestamps by `0.98` so subtitles remain frame-accurate at `1.02x` playback speed.
+### Rule 2: Toggleable Anti-Duplicate Fingerprinting (`src/renderer.py`)
+Fingerprinting is configured in `config.yaml`:
+```yaml
+anti_duplicate_enabled: true
+anti_duplicate_scale: 1.04
+anti_duplicate_contrast: 1.03
+anti_duplicate_saturation: 1.05
+anti_duplicate_speed: 1.02
+```
+When enabled for a render:
+- Subtle zoom: scale by `anti_duplicate_scale` and center-crop back to `1080x1920`.
+- Micro colour grade: `eq=contrast=<...>:saturation=<...>`.
+- Playback speed: `setpts=(1/speed)*PTS` on video and `atempo=<speed>` on audio.
+- Subtitle sync: multiply ASS dialogue timestamps by the **exact reciprocal** `1/speed`, not a rounded `0.98`.
+- When disabled, output the original timing, no zoom and no colour grade.
 - **Encoding Standard:** `libx264`, `-preset fast`, `-crf 21`, `-pix_fmt yuv420p`, audio `aac` `128k`.
+- Output path: `output/<lang_code>/<clip_id>_<lang_code>.mp4`.
 
 ### Rule 3: Subtitle Formatting & Wrapping (`src/transcriber.py`)
-- Output `.ass` (Advanced SubStation Alpha) subtitle files configured for `PlayResX: 1080`, `PlayResY: 1920`, using `DejaVu Sans`.
-- **Line Wrapping:** Wrap subtitle lines at **maximum 28–32 characters per line** (breaking cleanly at word boundaries using `\N`) so bold captions never overflow horizontally on mobile `9:16` screens.
-- **Safe Margins:** Default vertical bottom margin `MarginV = 220` so subtitles sit above TikTok / YouTube Shorts bottom UI buttons.
+- Output `.ass` subtitle files configured for `PlayResX: 1080`, `PlayResY: 1920`.
+- Wrap subtitle lines at **maximum 28–32 characters per line** at word boundaries using `\N`.
+- Default safe bottom margin `MarginV = 220`.
+- Use the clip's selected language for native transcription (`language=source_lang`; `None` for auto).
 
-### Rule 4: Resilient Translation & Hook Pipeline (`src/transcriber.py`)
-- Primary path: Use the `openai` Python SDK configured with `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODEL` from `.env` (compatible with Groq / Gemini OpenAI-compatible endpoints) to:
-  1. Translate transcribed segments into natural, gaming-slang-aware Russian.
-  2. Generate punchy EN and RU viral hook banner headlines (max ~45 chars).
-- Fallback path: If `LLM_API_KEY` is missing, invalid, or throws an API/rate-limit error (`429`), seamlessly fall back to `deep-translator` (`GoogleTranslator(source="auto", target="ru")`) and template-based hooks without crashing the batch job.
+### Rule 4: Native-First Localisation (`src/transcriber.py`)
+- **Native mode is the default:** transcribe and generate hook/title/description/hashtags/CTA in the selected clip language. Localized templates exist for `en, uk, es, de, fr, pl, pt, ru, ja, ko`; custom codes fall back safely.
+- **Translate mode is optional:** if `target_lang` is explicitly set and differs from the source language, translate subtitles and metadata via an OpenAI-compatible LLM.
+- LLM prompt must request strict JSON and validate translation array length.
+- Fallback path: `deep-translator` (`GoogleTranslator(source=..., target=...)`), then localized templates.
+- Never claim a target variant is translated when subtitles remain in the source language; mark its `mode`/`source`.
 
-### Rule 5: Fetcher & Deduplication (`src/fetcher.py`)
-- Support Twitch Helix API (`OAuth2 client_credentials` token acquisition + `/helix/games` + `/helix/clips`) and direct Twitch/YouTube URLs via `yt-dlp`.
-- Track processed clip IDs and metadata in `data/processed_clips.json`. Allow force re-download/re-processing if explicitly checked by the user in the UI.
+### Rule 5: Language-First Fetcher (`src/fetcher.py`)
+- Resolve the game dynamically via Twitch Helix `/helix/games`.
+- **Twitch `/helix/clips` has no `language` query parameter.** Request `first=100` pages with the `after` cursor (up to 10 pages) and filter `clip['language'] == target_language` until the requested limit is reached.
+- Include each clip's detected `language` in normalized metadata and workspace queue items.
+- Keep `data/processed_clips.json` deduplication and explicit force re-download.
 
-### Rule 6: YouTube Scheduled Uploader (`src/uploader.py`)
-- Support separate OAuth2 credential tokens (`data/token_en.json` and `data/token_ru.json`) using `google-api-python-client` and `google-auth-oauthlib`.
-- Enforce spacing via ISO-8601 `publishAt` timestamps (`start_time` + `N * interval_hours`) and a hard daily quota guard (**max 5 uploads/day** per channel).
+### Rule 6: Dynamic Per-Language YouTube Uploader (`src/uploader.py`)
+- Store OAuth2 tokens at `data/token_<lang_code>.json` for any ISO 639-1 code.
+- Keep ISO-8601 `publishAt` spacing and a hard daily quota guard (**max 5 uploads/day** per language channel).
+- `defaultLanguage`/`defaultAudioLanguage` and upload history are keyed by the token's language.
 
 ---
 
 ## 6. GUI Architecture (`app.py`)
 
 ### Global & Sidebar Requirements
-- Configure dark theme in `.streamlit/config.toml` (`base="dark"`).
-- Store clip queues, selection states, crop coordinates, and rendered metadata in `st.session_state` so widget interactions never reset active workflows.
-- **Sidebar:**
-  - System health indicators: FFmpeg binary check, Whisper model status, Processed Clips counter.
-  - **"Generate Synthetic Test Clip"** button: Generates a 5-second `1280x720` test video (`testsrc` + `sine` audio via FFmpeg) and runs the full transcription + EN/RU rendering pipeline end-to-end so the app can be verified immediately with zero API keys.
+- `st.set_page_config(page_title="ClipForge Studio", layout="wide")`.
+- Persist clip queues, selection states, crop coordinates and render metadata in `st.session_state`.
+- **Sidebar:** FFmpeg check, Whisper status, processed-clip count, active pipeline language, and **"Generate Synthetic Test Clip"** which runs the full native pipeline for the currently selected language with zero API keys.
 
-### Tab 1: Fetch & Queue (`Збір кліпів`)
-- **Manual URLs:** Multi-line `st.text_area` for Twitch clip or YouTube URLs.
-- **Twitch Auto-Fetcher:** Inputs for Game Name (default `"Grand Theft Auto VI"`), Timeframe (`24h`, `7d`), Clip Limit (`1–20`), and **"Fetch Top Clips"** button.
-- **Interactive Clip Queue:** Cards/rows displaying thumbnail, streamer username, title, view count, duration, selection checkbox, and a `Processed` badge if found in `data/processed_clips.json` (with a "Force Re-download" option).
-- **"Download Selected to Workspace"** button with `st.progress` saving to `workspace/raw/<clip_id>.mp4`.
+### Tab 1: Fetch & Queue
+- **Step 1 — Language:** All Languages, popular ISO-639-1 languages, and a custom code input.
+- **Step 2 — Game:** free-text game name with quick-select presets (GTA VI, Counter-Strike 2, Valorant, Dota 2, Minecraft, Just Chatting).
+- Manual URL queue plus Twitch auto-fetch (timeframe + limit).
+- Clip cards show thumbnail, title, language badge `[EN]`/`[UK]`/etc., game, streamer, views, duration, processed badge, force re-download, and selection.
 
-### Tab 2: Crop & Style Studio (`Рамка вебкамери та стиль`)
-- Select any clip from `workspace/raw/` and auto-load the streamer's preset from `presets.json` (fallback to `"default"`).
-- Controls:
-  - 4 sliders (`cam_x`, `cam_y`, `cam_w`, `cam_h` from `0.0` to `1.0`).
-  - Layout mode toggle: **Split-Screen (Webcam + Gameplay)** vs **Full-Screen 9:16 Gameplay with Blurred BG**.
-  - Subtitle & Hook styling: font size, primary color (`#FFFF00`, `#FFFFFF`, etc.), outline thickness, and `MarginV` (default `220`).
-- **Live Visual Preview:** Extract middle frame via FFmpeg and render two side-by-side `Pillow` images:
-  1. Original `16:9` frame with a **bright green** rectangle (webcam crop) and **blue** rectangle (gameplay crop).
-  2. Resulting `9:16` composite preview (`1080x1920` scaled for UI) showing sample hook banner and subtitle placement.
-- **"Save Preset for Streamer"** button persisting coordinates into `presets.json`.
+### Tab 2: Crop & Style
+- Load streamer presets from `presets.json` (fallback `"default"`).
+- Four normalized crop sliders, split/blur layout toggle, subtitle/hook styling.
+- Live Pillow preview of source crop and resulting `9:16` composite.
 
-### Tab 3: Batch Render & Preview (`Рендер та перевірка`)
-- **"Render Selected Clips (EN + RU)"** button running `transcriber.py` and `renderer.py` sequentially with `st.progress` and `st.status` step logging (`Transcribing -> Translating -> Rendering EN -> Rendering RU`).
-- **Side-by-Side Output Gallery:**
-  - Two columns per clip: **English Version (EN)** on the left, **Russian Version (RU)** on the right.
-  - Native `st.video()` players for `output/en/<clip_id>_en.mp4` and `output/ru/<clip_id>_ru.mp4`.
-  - Editable fields below each player: Hook Banner Text, Video Title, Description & Hashtags, and Pinned Comment CTA (pre-filled with Telegram funnel template for `RU` and engagement/affiliate template for `EN`).
-  - Action buttons per video: **"Re-render Hook Text"**, **"Open Output Folder"** (triggers `xdg-open`), and **"Schedule to YouTube"**.
+### Tab 3: Batch Render & Preview
+- Render selected clips in their **native selected language**.
+- Optional **"Also generate a translated version"** toggle with target language selector.
+- Anti-duplicate fingerprinting checkbox.
+- Responsive per-language preview cards with editable localized Hook, Title, Description and CTA.
+- Per-variant **Re-render Hook**, **Open Folder**, and **Schedule to YouTube** actions.
 
-### Tab 4: Settings & Channels (`Налаштування та API`)
-- Masked credential editor for `.env` (`TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET`, `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`) with a **"Save .env"** button.
-- Whisper model selector (`tiny`, `base`, `small`, `medium`) persisted to `config.yaml`.
-- YouTube OAuth connection status indicators (`token_en.json`, `token_ru.json`) + scheduling controls (`start_time`, `interval_hours`, max 5 uploads/day guard).
+### Tab 4: Settings & Channels
+- Masked `.env` editor for Twitch/LLM credentials.
+- Whisper model selector and fingerprinting toggle persisted to `config.yaml`.
+- Dynamic YouTube OAuth management for any selected language code (`data/token_<lang>.json`).
+- Scheduling controls (`start_time`, `interval_hours`, slot index) and dynamic per-language quota table.
 
 ---
 
 ## 7. Definition of Done (Verification Checklist)
-Before completing any task on this repository:
-1. Run `python3 -m py_compile app.py src/*.py` and confirm exit code `0` with zero syntax errors.
-2. Verify all runtime directories and default config files (`config.yaml`, `presets.json`, `.env.example`, `.streamlit/config.toml`) exist and parse cleanly.
-3. Verify the **"Generate Synthetic Test Clip"** flow creates a 5-second synthetic `.mp4`, executes `transcriber.py` and `renderer.py`, and produces valid, playable `output/en/<id>_en.mp4` and `output/ru/<id>_ru.mp4` files with distinct durations/hashes (`1.0x` vs `1.02x`) and burned-in UTF-8 hook + subtitles.
+Before completing any task:
+1. `python3 -m py_compile app.py src/*.py tests/smoke_test.py` exits `0`.
+2. `ruff check .` passes with no errors.
+3. Runtime directories and default config files parse cleanly.
+4. The synthetic test creates a 5-second clip and produces valid `output/en/synth_test_en.mp4` and `output/uk/synth_test_uk.mp4` with distinct fingerprints, native metadata, `.ass` subtitles and UTF-8 hooks.
+5. No hardcoded GTA VI-only, EN/RU-only, or `token_en`/`token_ru` assumptions remain outside default presets/config values.
 
 ## Autonomous Execution & Delegation Policy
-- Act as an autonomous Tech Lead: break the build into sequential milestones (1. Configs & Skeleton -> 2. src/fetcher.py -> 3. src/transcriber.py -> 4. src/renderer.py -> 5. src/uploader.py -> 6. app.py -> 7. End-to-End Verification).
-- Delegate repository inspection and file discovery to the `explore` subagent.
-- Delegate architectural design, FFmpeg filtergraph validation, and root-cause debugging to the `architect` subagent.
-- Delegate module code generation to the `coder` subagent to balance throughput across free providers.
-- After completing each milestone, run `python3 -m py_compile app.py src/*.py` (for existing files) and `ruff check .`, fix all issues immediately, and create a local `git commit` checkpoint before starting the next module.
+- Act as an autonomous Tech Lead: discover, design, implement, verify, and commit only when requested.
+- Delegate repository inspection/file discovery to the `explore` subagent when available.
+- Delegate architecture/FFmpeg filtergraph review and root-cause debugging to the `architect` subagent.
+- Delegate module code generation to the `coder` subagent when providers are healthy; if unavailable, implement directly and verify thoroughly.
+- After each milestone, run `python3 -m py_compile ...` and `ruff check .`, fix all issues immediately, then continue.

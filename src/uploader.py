@@ -1,14 +1,16 @@
-"""YouTube Data API v3 uploader with per-channel quota and scheduling guards.
+"""YouTube Data API v3 uploader with per-language channels and quota guards.
 
-Two independent OAuth2 token files (EN and RU) are supported.  Uploads are
-spaced with ISO-8601 ``publishAt`` timestamps and a local upload ledger keeps a
-hard cap of five uploads per channel per UTC day.
+Each language niche uses its own OAuth2 token file under ``data/`` named
+``token_<lang_code>.json`` (for example ``token_en.json`` or ``token_uk.json``).
+Uploads are spaced with ISO-8601 ``publishAt`` timestamps and a local ledger
+keeps a hard cap of five uploads per language channel per UTC day.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -22,18 +24,15 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
 
+from src.languages import normalize_language, validate_language_code
+
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
-TOKEN_FILES = {
-    "en": DATA_DIR / "token_en.json",
-    "ru": DATA_DIR / "token_ru.json",
-}
-TOKEN_EN_FILE = TOKEN_FILES["en"]
-TOKEN_RU_FILE = TOKEN_FILES["ru"]
 CLIENT_SECRETS_FILE = DATA_DIR / "client_secret.json"
 UPLOAD_HISTORY_FILE = DATA_DIR / "upload_history.json"
+TOKEN_GLOB = "token_*.json"
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 QUOTA_MAX_DAILY_UPLOADS = 5
@@ -42,6 +41,8 @@ MAX_DESCRIPTION_LENGTH = 5000
 MIN_SCHEDULE_LEAD = timedelta(minutes=15)
 MAX_SCHEDULE_INTERVAL_HOURS = 168
 UPLOAD_RETRIES = 3
+
+_TOKEN_PATTERN = re.compile(r"^token_([a-z]{2,3})[.]json$")
 
 
 def _ensure_dirs() -> None:
@@ -67,15 +68,49 @@ def _write_json(path: Path, payload: Any) -> None:
     temp_path.replace(path)
 
 
+def get_token_path(language: str) -> Path:
+    """Return the canonical token path for a language code."""
+    return DATA_DIR / f"token_{validate_language_code(language)}.json"
+
+
+def token_language(token_file: str | Path) -> str:
+    """Extract a language code from a ``token_<lang>.json`` path."""
+    name = Path(token_file).name
+    match = _TOKEN_PATTERN.fullmatch(name)
+    if not match:
+        raise ValueError(f"Token filename does not contain a language code: {name}")
+    return validate_language_code(match.group(1))
+
+
+def list_connected_languages() -> list[str]:
+    """Return every language with a token file, sorted alphabetically."""
+    languages: set[str] = set()
+    for path in DATA_DIR.glob(TOKEN_GLOB):
+        match = _TOKEN_PATTERN.fullmatch(path.name)
+        if match:
+            code = normalize_language(match.group(1))
+            if code:
+                languages.add(code)
+    return sorted(languages)
+
+
+def _normalize_language_list(languages: list[str] | None) -> list[str]:
+    codes: list[str] = []
+    for item in languages or []:
+        code = normalize_language(item)
+        if code and code not in codes:
+            codes.append(code)
+    return codes
+
+
 def _load_history() -> dict[str, list[dict[str, Any]]]:
     payload = _read_json(UPLOAD_HISTORY_FILE, {})
     history: dict[str, list[dict[str, Any]]] = {}
     if isinstance(payload, dict):
         for channel, entries in payload.items():
-            if channel in TOKEN_FILES and isinstance(entries, list):
-                history[channel] = [entry for entry in entries if isinstance(entry, dict)]
-    for channel in TOKEN_FILES:
-        history.setdefault(channel, [])
+            code = normalize_language(channel)
+            if code and isinstance(entries, list):
+                history[code] = [entry for entry in entries if isinstance(entry, dict)]
     return history
 
 
@@ -83,10 +118,11 @@ def _save_history(history: dict[str, list[dict[str, Any]]]) -> None:
     _write_json(UPLOAD_HISTORY_FILE, history)
 
 
-def _today_count(channel: str) -> int:
+def _today_count(language: str) -> int:
+    code = validate_language_code(language)
     today = datetime.now(UTC).date()
     count = 0
-    for entry in _load_history().get(channel, []):
+    for entry in _load_history().get(code, []):
         raw_timestamp = entry.get("uploaded_at")
         if not isinstance(raw_timestamp, str):
             continue
@@ -102,9 +138,10 @@ def _today_count(channel: str) -> int:
     return count
 
 
-def _record_upload(channel: str, video_id: str, publish_at: datetime) -> None:
+def _record_upload(language: str, video_id: str, publish_at: datetime) -> None:
+    code = validate_language_code(language)
     history = _load_history()
-    history.setdefault(channel, []).append(
+    history.setdefault(code, []).append(
         {
             "video_id": video_id,
             "publish_at": publish_at.isoformat(),
@@ -184,20 +221,18 @@ def get_token_status(token_file: Path) -> dict[str, Any]:
     return status
 
 
-def check_daily_quota(channel_or_token: str | Path) -> bool:
+def check_daily_quota(language_or_token: str | Path) -> bool:
     """Return True when another upload is allowed for this channel today."""
-    if isinstance(channel_or_token, Path):
-        channel = "en" if channel_or_token == TOKEN_EN_FILE else "ru"
+    if isinstance(language_or_token, Path):
+        code = token_language(language_or_token)
     else:
-        channel = "en" if str(channel_or_token).lower() == "en" else "ru"
-    return _today_count(channel) < QUOTA_MAX_DAILY_UPLOADS
+        code = validate_language_code(language_or_token)
+    return _today_count(code) < QUOTA_MAX_DAILY_UPLOADS
 
 
-def authorize_channel(channel: str, client_secrets_file: Path | None = None) -> Path:
-    """Run the installed-app OAuth flow and save a token for one channel."""
-    key = channel.lower()
-    if key not in TOKEN_FILES:
-        raise ValueError("channel must be 'en' or 'ru'")
+def authorize_channel(language: str, client_secrets_file: Path | None = None) -> Path:
+    """Run the installed-app OAuth flow and save a token for one language."""
+    code = validate_language_code(language)
     secrets_path = Path(client_secrets_file) if client_secrets_file else CLIENT_SECRETS_FILE
     if not secrets_path.exists():
         raise FileNotFoundError(
@@ -206,10 +241,10 @@ def authorize_channel(channel: str, client_secrets_file: Path | None = None) -> 
         )
     flow = InstalledAppFlow.from_client_secrets_file(str(secrets_path), SCOPES)
     creds = flow.run_local_server(port=0, prompt="consent")
-    token_file = TOKEN_FILES[key]
+    token_file = get_token_path(code)
     _ensure_dirs()
     token_file.write_text(creds.to_json(), encoding="utf-8")
-    logger.info("Saved %s channel token to %s", key.upper(), token_file)
+    logger.info("Saved %s channel token to %s", code.upper(), token_file)
     return token_file
 
 
@@ -237,11 +272,12 @@ def schedule_video(
     publish_at: datetime | None = None,
     category: int = 22,
     privacy: str = "public",
+    language: str | None = None,
 ) -> str | None:
     """Upload a video with ``publishAt`` and return its YouTube video id."""
     token_file = Path(token_file)
     video_path = Path(video_path)
-    channel = "en" if token_file == TOKEN_EN_FILE else "ru"
+    code = validate_language_code(language) if language else token_language(token_file)
 
     if not video_path.exists() or video_path.stat().st_size == 0:
         logger.error("Video file is missing or empty: %s", video_path)
@@ -251,8 +287,8 @@ def schedule_video(
     except ValueError as exc:
         logger.error("Invalid YouTube metadata: %s", exc)
         return None
-    if _today_count(channel) >= QUOTA_MAX_DAILY_UPLOADS:
-        logger.error("Daily upload quota reached for %s channel.", channel.upper())
+    if _today_count(code) >= QUOTA_MAX_DAILY_UPLOADS:
+        logger.error("Daily upload quota reached for %s channel.", code.upper())
         return None
 
     service = get_youtube_service(token_file)
@@ -273,8 +309,8 @@ def schedule_video(
             "description": description.strip(),
             "tags": cleaned_tags,
             "categoryId": str(category),
-            "defaultLanguage": "ru" if channel == "ru" else "en",
-            "defaultAudioLanguage": "ru" if channel == "ru" else "en",
+            "defaultLanguage": code,
+            "defaultAudioLanguage": code,
         },
         "status": {
             "privacyStatus": "private",
@@ -327,9 +363,9 @@ def schedule_video(
     if not video_id:
         logger.error("YouTube upload finished without a video id.")
         return None
-    _record_upload(channel, video_id, publish_at)
+    _record_upload(code, video_id, publish_at)
     logger.info(
-        "Scheduled %s video %s for %s", channel.upper(), video_id, publish_at.isoformat()
+        "Scheduled %s video %s for %s", code.upper(), video_id, publish_at.isoformat()
     )
     return video_id
 
@@ -342,10 +378,14 @@ class YouTubeUploader:
 
     @property
     def token_files(self) -> dict[str, Path]:
-        return dict(TOKEN_FILES)
+        return {code: get_token_path(code) for code in list_connected_languages()}
 
-    def token_status(self) -> dict[str, dict[str, Any]]:
-        return {channel: get_token_status(path) for channel, path in TOKEN_FILES.items()}
+    def token_status(self, languages: list[str] | None = None) -> dict[str, dict[str, Any]]:
+        codes = _normalize_language_list(languages)
+        for code in list_connected_languages():
+            if code not in codes:
+                codes.append(code)
+        return {code: get_token_status(get_token_path(code)) for code in codes}
 
     def upload(
         self,
@@ -358,11 +398,11 @@ class YouTubeUploader:
         interval_hours: int = 24,
         slot_index: int = 0,
     ) -> bool:
-        """Schedule one EN or RU video and respect the daily quota."""
-        key = "ru" if str(language).lower().startswith("ru") else "en"
-        token_file = TOKEN_FILES[key]
+        """Schedule one language-specific video and respect the daily quota."""
+        code = validate_language_code(language)
+        token_file = get_token_path(code)
         if not token_file.exists():
-            logger.error("No OAuth token connected for %s channel.", key.upper())
+            logger.error("No OAuth token connected for %s channel.", code.upper())
             return False
 
         interval = max(1, min(int(interval_hours), MAX_SCHEDULE_INTERVAL_HOURS))
@@ -374,11 +414,7 @@ class YouTubeUploader:
                 start_time = start_time.replace(tzinfo=UTC)
             publish_at = start_time + timedelta(hours=interval * slot)
 
-        default_tags = (
-            ["gaming", "GTA6", "shorts", "russian", "вирусный"]
-            if key == "ru"
-            else ["gaming", "GTA6", "shorts", "viral"]
-        )
+        default_tags = ["gaming", "shorts", "viral", code]
         video_id = schedule_video(
             token_file=token_file,
             video_path=Path(video_path),
@@ -387,23 +423,31 @@ class YouTubeUploader:
             tags=tags or default_tags,
             publish_at=publish_at,
             privacy="public",
+            language=code,
         )
         return bool(video_id)
 
-    def check_quota_status(self) -> dict[str, dict[str, Any]]:
+    def check_quota_status(
+        self, languages: list[str] | None = None
+    ) -> dict[str, dict[str, Any]]:
         """Return per-channel quota usage for the Settings tab."""
-        status: dict[str, dict[str, Any]] = {}
+        codes = _normalize_language_list(languages)
+        for code in list_connected_languages():
+            if code not in codes:
+                codes.append(code)
         history = _load_history()
-        for channel, token_file in TOKEN_FILES.items():
-            used = _today_count(channel)
-            status[channel] = {
+        status: dict[str, dict[str, Any]] = {}
+        for code in codes:
+            token_file = get_token_path(code)
+            used = _today_count(code)
+            status[code] = {
                 "token_file": str(token_file),
                 "connected": token_file.exists(),
                 "max_daily": self.max_daily,
                 "used_today": used,
                 "remaining": max(0, self.max_daily - used),
                 "ok": used < self.max_daily,
-                "recent": history.get(channel, [])[-5:],
+                "recent": history.get(code, [])[-5:],
             }
         return status
 

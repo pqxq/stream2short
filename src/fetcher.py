@@ -1,7 +1,9 @@
 """Clip discovery and download helpers.
 
-This module talks to the Twitch Helix API, downloads clips with yt-dlp and
-keeps a persistent deduplication index in ``data/processed_clips.json``.
+The fetcher resolves a game dynamically through the Twitch Helix ``/games``
+endpoint and paginates ``/helix/clips`` in order to filter by language on the
+client side.  Twitch does not expose a ``language`` query parameter for clips,
+so page size is fixed at 100 and up to ten pages are scanned per request.
 """
 
 from __future__ import annotations
@@ -10,17 +12,21 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
 
 import requests
+import yaml
 import yt_dlp
+
+from src.languages import normalize_language
 
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+CONFIG_PATH = PROJECT_ROOT / "config.yaml"
 DATA_DIR = PROJECT_ROOT / "data"
 PROCESSED_CLIPS_FILE = DATA_DIR / "processed_clips.json"
 
@@ -30,6 +36,9 @@ TWITCH_OAUTH_URL = "https://id.twitch.tv/oauth2/token"
 DEFAULT_GAME = "Grand Theft Auto VI"
 VIDEO_SUFFIXES = (".mp4", ".mkv", ".webm", ".mov", ".flv")
 REQUEST_TIMEOUT = 30
+MAX_CLIP_PAGES = 10
+PAGE_SIZE = 100
+MAX_REQUEST_ATTEMPTS = 3
 
 
 def _ensure_dirs() -> None:
@@ -53,6 +62,39 @@ def _atomic_json_write(path: Path, payload: Any) -> None:
     temp_path.replace(path)
 
 
+def load_config() -> dict[str, Any]:
+    """Load config.yaml with a minimal safe fallback."""
+    config: dict[str, Any] = {"default_game": DEFAULT_GAME, "default_language": "en"}
+    if CONFIG_PATH.exists():
+        try:
+            with CONFIG_PATH.open("r", encoding="utf-8") as handle:
+                loaded = yaml.safe_load(handle) or {}
+            if isinstance(loaded, dict):
+                config.update(loaded)
+        except (OSError, yaml.YAMLError) as exc:
+            logger.warning("Could not read %s: %s", CONFIG_PATH, exc)
+    return config
+
+
+def get_default_game() -> str:
+    """Return the configured default game name."""
+    game = str(load_config().get("default_game") or DEFAULT_GAME).strip()
+    return game or DEFAULT_GAME
+
+
+def _normalize_period(period: str) -> str:
+    mapping = {
+        "24h": "day",
+        "day": "day",
+        "7d": "week",
+        "week": "week",
+        "30d": "month",
+        "month": "month",
+        "all": "all",
+    }
+    return mapping.get(str(period).strip().lower(), "week")
+
+
 def _normalize_twitch_clip(clip: dict[str, Any], game_name: str) -> dict[str, Any]:
     clip_id = str(clip.get("id") or "").strip()
     url = clip.get("url") or (f"https://clips.twitch.tv/{clip_id}" if clip_id else "")
@@ -68,6 +110,7 @@ def _normalize_twitch_clip(clip: dict[str, Any], game_name: str) -> dict[str, An
         "game": game_name,
         "created_at": created_at,
         "source": "twitch",
+        "language": str(clip.get("language") or "").strip().lower(),
     }
 
 
@@ -141,56 +184,171 @@ class ClipFetcher:
             return None
         return {"Authorization": f"Bearer {token}", "Client-ID": self.client_id}
 
-    def _find_game_id(self, game_name: str, headers: dict[str, str]) -> str | None:
-        url = f"{TWITCH_API_BASE}/games?name={quote(game_name)}"
-        try:
-            response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-            response.raise_for_status()
-            games = response.json().get("data", [])
-        except (requests.RequestException, ValueError) as exc:
-            logger.error("Twitch game lookup failed: %s", exc)
+    def _twitch_get(self, path: str, params: dict[str, Any]) -> dict[str, Any] | None:
+        """GET a Helix endpoint with bounded retries and one token refresh."""
+        refreshed = False
+        for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
+            headers = self._headers()
+            if not headers:
+                return None
+            url = f"{TWITCH_API_BASE}{path}"
+            try:
+                response = requests.get(
+                    url, headers=headers, params=params, timeout=REQUEST_TIMEOUT
+                )
+            except requests.RequestException as exc:
+                logger.warning(
+                    "Twitch request %s failed (attempt %d/%d): %s",
+                    path,
+                    attempt,
+                    MAX_REQUEST_ATTEMPTS,
+                    exc,
+                )
+                if attempt == MAX_REQUEST_ATTEMPTS:
+                    return None
+                time.sleep(min(2**attempt, 8))
+                continue
+
+            if response.status_code in {401, 403} and not refreshed:
+                logger.info("Twitch token rejected; refreshing once.")
+                self._token = None
+                refreshed = True
+                continue
+            if response.status_code == 429 or response.status_code >= 500:
+                retry_after = response.headers.get("Retry-After")
+                try:
+                    wait_seconds = float(retry_after) if retry_after else float(2**attempt)
+                except (TypeError, ValueError):
+                    wait_seconds = float(2**attempt)
+                logger.warning(
+                    "Twitch HTTP %s on %s (attempt %d/%d); retrying in %.1fs",
+                    response.status_code,
+                    path,
+                    attempt,
+                    MAX_REQUEST_ATTEMPTS,
+                    wait_seconds,
+                )
+                if attempt == MAX_REQUEST_ATTEMPTS:
+                    return None
+                time.sleep(min(wait_seconds, 15.0))
+                continue
+
+            try:
+                response.raise_for_status()
+                payload = response.json()
+            except (requests.RequestException, ValueError) as exc:
+                logger.error("Twitch request %s failed: %s", path, exc)
+                return None
+            return payload if isinstance(payload, dict) else None
+        return None
+
+    def _find_game_id(self, game_name: str) -> str | None:
+        payload = self._twitch_get("/games", {"name": game_name})
+        if payload is None:
+            logger.error("Twitch game lookup failed for %s", game_name)
             return None
+        games = [game for game in payload.get("data", []) if isinstance(game, dict)]
         if not games:
             logger.warning("Twitch game not found: %s", game_name)
             return None
-        return str(games[0]["id"])
+        exact = next(
+            (
+                game
+                for game in games
+                if str(game.get("name") or "").strip().casefold() == game_name.strip().casefold()
+            ),
+            None,
+        )
+        selected = exact or games[0]
+        if len(games) > 1 and exact is None:
+            logger.info(
+                "Multiple Twitch games matched %s; using %s",
+                game_name,
+                selected.get("name"),
+            )
+        return str(selected.get("id") or "") or None
 
     def fetch_top_clips(
-        self, game_name: str = DEFAULT_GAME, first: int = 10, period: str = "7d"
+        self,
+        game_name: str | None = None,
+        first: int = 10,
+        period: str = "7d",
+        language: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Return normalized metadata for the most popular clips of a game."""
-        headers = self._headers()
-        if not headers:
+        """Return normalized metadata for popular clips, optionally by language."""
+        resolved_game = (game_name or get_default_game()).strip() or get_default_game()
+        if not self._headers():
             return []
-        game_id = self._find_game_id(game_name, headers)
+        game_id = self._find_game_id(resolved_game)
         if not game_id:
             return []
+
         safe_first = max(1, min(int(first), 100))
-        safe_period = period if period in {"day", "week", "month", "all", "24h", "7d", "30d"} else "7d"
-        if safe_period == "24h":
-            safe_period = "day"
-        elif safe_period == "7d":
-            safe_period = "week"
-        elif safe_period == "30d":
-            safe_period = "month"
-        url = (
-            f"{TWITCH_API_BASE}/clips?game_id={quote(game_id)}"
-            f"&first={safe_first}&period={safe_period}&is_relevant=True"
+        safe_period = _normalize_period(period)
+        target_language = normalize_language(language)
+
+        collected: list[dict[str, Any]] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+
+        for page in range(MAX_CLIP_PAGES):
+            params: dict[str, Any] = {
+                "game_id": game_id,
+                "first": PAGE_SIZE,
+                "period": safe_period,
+                "is_relevant": "true",
+            }
+            if cursor:
+                params["after"] = cursor
+            payload = self._twitch_get("/clips", params)
+            if payload is None:
+                break
+
+            clips = payload.get("data", [])
+            if not isinstance(clips, list) or not clips:
+                break
+
+            for clip in clips:
+                if not isinstance(clip, dict) or not clip.get("id"):
+                    continue
+                normalized = _normalize_twitch_clip(clip, resolved_game)
+                if target_language is not None and normalized["language"] != target_language:
+                    continue
+                collected.append(normalized)
+                if len(collected) >= safe_first:
+                    break
+
+            if len(collected) >= safe_first:
+                break
+
+            next_cursor = payload.get("pagination", {}).get("cursor")
+            if not next_cursor or next_cursor in seen_cursors:
+                break
+            seen_cursors.add(next_cursor)
+            cursor = str(next_cursor)
+            logger.debug(
+                "Fetched page %d for %s; %d matching clips so far",
+                page + 1,
+                resolved_game,
+                len(collected),
+            )
+
+        result = collected[:safe_first]
+        if target_language and len(result) < safe_first:
+            logger.info(
+                "Only %d/%d clips matched language '%s' after scanning up to %d pages.",
+                len(result),
+                safe_first,
+                target_language,
+                MAX_CLIP_PAGES,
+            )
+        logger.info(
+            "Fetched %d Twitch clips for %s (language=%s)",
+            len(result),
+            resolved_game,
+            target_language or "all",
         )
-        try:
-            response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-            response.raise_for_status()
-            clips = response.json().get("data", [])
-        except (requests.RequestException, ValueError) as exc:
-            logger.error("Twitch clip fetch failed: %s", exc)
-            return []
-        normalized = [
-            _normalize_twitch_clip(clip, game_name)
-            for clip in clips
-            if isinstance(clip, dict) and clip.get("id")
-        ]
-        logger.info("Fetched %d Twitch clips for %s", len(normalized), game_name)
-        return normalized
+        return result
 
     def load_processed(self) -> list[dict[str, Any]]:
         return load_processed_clips()
@@ -324,16 +482,22 @@ class ClipFetcher:
             }
 
         metadata = {**clip_data, "id": clip_id, "raw_path": str(path)}
+        metadata.setdefault("language", normalize_language(clip_data.get("language")) or "")
         metadata.setdefault("processed_at", _iso_now())
         self.mark_processed(clip_id, metadata)
         return {"ok": True, "path": path, "skipped": False, "error": None, "clip_id": clip_id}
 
 
 def fetch_twitch_clips(
-    game_name: str = DEFAULT_GAME, first: int = 10, period: str = "7d"
+    game_name: str | None = None,
+    first: int = 10,
+    period: str = "7d",
+    language: str | None = None,
 ) -> list[dict[str, Any]]:
     """Convenience wrapper used by the UI."""
-    return ClipFetcher().fetch_top_clips(game_name=game_name, first=first, period=period)
+    return ClipFetcher().fetch_top_clips(
+        game_name=game_name, first=first, period=period, language=language
+    )
 
 
 def download_clip_with_ytdlp(url: str, output_dir: Path) -> Path | None:

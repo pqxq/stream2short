@@ -1,9 +1,9 @@
-"""FFmpeg compositor for vertical 9:16 EN/RU clips.
+"""FFmpeg compositor for vertical 9:16 clips in any language.
 
 Every dynamic banner string is written to a UTF-8 text file and passed to
 ``drawtext`` via ``textfile=``; no user text is ever interpolated into a
-filtergraph.  The EN and RU outputs intentionally differ in zoom, colour grade
-and playback speed to reduce cross-platform duplicate detection.
+filtergraph.  Anti-duplicate fingerprinting (zoom, colour grade and speed) is
+optional and applies equally to every language.
 """
 
 from __future__ import annotations
@@ -18,6 +18,8 @@ from typing import Any
 import yaml
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
+from src.languages import normalize_language, validate_language_code
+
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -25,8 +27,7 @@ CONFIG_PATH = PROJECT_ROOT / "config.yaml"
 PRESETS_PATH = PROJECT_ROOT / "presets.json"
 WORKSPACE_TEMP = PROJECT_ROOT / "workspace" / "temp"
 WORKSPACE_RAW = PROJECT_ROOT / "workspace" / "raw"
-OUTPUT_EN_DIR = PROJECT_ROOT / "output" / "en"
-OUTPUT_RU_DIR = PROJECT_ROOT / "output" / "ru"
+OUTPUT_ROOT = PROJECT_ROOT / "output"
 
 DEFAULT_PRESET = {"cam_x": 0.0, "cam_y": 0.0, "cam_w": 0.2, "cam_h": 0.25}
 FONT_CANDIDATES = (
@@ -34,6 +35,11 @@ FONT_CANDIDATES = (
     "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
 )
+CJK_FONT_CANDIDATES = (
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+)
+CJK_FONT_FAMILIES = {"ja": "Noto Sans CJK JP", "ko": "Noto Sans CJK KR"}
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "width": 1080,
@@ -43,17 +49,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "primary_color": "#FFFF00",
     "outline_thickness": 2,
     "margin_v": 220,
-    "en_scale": 1.0,
-    "ru_scale": 1.04,
-    "ru_contrast": 1.03,
-    "ru_saturation": 1.05,
+    "anti_duplicate_enabled": True,
+    "anti_duplicate_scale": 1.04,
+    "anti_duplicate_contrast": 1.03,
+    "anti_duplicate_saturation": 1.05,
+    "anti_duplicate_speed": 1.02,
     "audio_sample_rate": 44100,
 }
 
 CAM_PANEL_HEIGHT = 640
-RU_PLAYBACK_SPEED = 1.02
-RU_SUBTITLE_FACTOR = round(1.0 / RU_PLAYBACK_SPEED, 6)
-RU_SETPTS_FACTOR = f"{RU_SUBTITLE_FACTOR:.6f}"
 
 
 def load_config() -> dict[str, Any]:
@@ -112,11 +116,27 @@ def save_preset(
     return presets
 
 
-def resolve_font_path() -> str:
+def font_family_for(lang_code: str | None) -> str:
+    code = normalize_language(lang_code)
+    if code in CJK_FONT_FAMILIES and any(Path(path).exists() for path in CJK_FONT_CANDIDATES):
+        return CJK_FONT_FAMILIES[code]
+    return "DejaVu Sans"
+
+
+def resolve_font_path(lang_code: str | None = None) -> str:
+    code = normalize_language(lang_code)
+    if code in CJK_FONT_FAMILIES:
+        for candidate in CJK_FONT_CANDIDATES:
+            if Path(candidate).exists():
+                return candidate
     for candidate in FONT_CANDIDATES:
         if Path(candidate).exists():
             return candidate
     return FONT_CANDIDATES[0]
+
+
+def output_dir_for(lang_code: str) -> Path:
+    return OUTPUT_ROOT / validate_language_code(lang_code)
 
 
 def _even(value: float, upper: int | None = None) -> int:
@@ -161,9 +181,10 @@ def _format_ass_timestamp(seconds: float) -> str:
 
 
 def adjust_ass_timestamps(ass_path: Path, factor: float, suffix: str = "adjusted") -> Path:
-    """Copy an ASS file with all dialogue timestamps multiplied by ``factor``."""
+    """Copy an ASS file with all Dialogue timestamps multiplied by ``factor``."""
     source = Path(ass_path)
-    target = source.with_name(f"{source.stem}_{suffix}.ass")
+    safe_suffix = re.sub(r"[^A-Za-z0-9_.-]+", "_", suffix) or "adjusted"
+    target = source.with_name(f"{source.stem}_{safe_suffix}.ass")
     pattern = re.compile(r"^(Dialogue:\s*[^,]*,)([^,]+),([^,]+),(.*)$")
     output_lines: list[str] = []
     for line in source.read_text(encoding="utf-8").splitlines():
@@ -179,7 +200,7 @@ def adjust_ass_timestamps(ass_path: Path, factor: float, suffix: str = "adjusted
 
 
 class FFmpegRenderer:
-    """Build split-screen or blurred 9:16 clips with EN/RU fingerprinting."""
+    """Build split-screen or blurred 9:16 clips with optional fingerprinting."""
 
     def __init__(
         self,
@@ -209,11 +230,17 @@ class FFmpegRenderer:
         self.primary_color = str(self.config["primary_color"])
         self.outline_thickness = int(self.config["outline_thickness"])
         self.margin_v = int(self.config["margin_v"])
-        self.ru_scale = float(self.config.get("ru_scale", 1.04))
-        self.ru_contrast = float(self.config.get("ru_contrast", 1.03))
-        self.ru_saturation = float(self.config.get("ru_saturation", 1.05))
+        self.anti_duplicate_enabled = bool(self.config.get("anti_duplicate_enabled", True))
+        self.anti_duplicate_scale = max(
+            1.0, float(self.config.get("anti_duplicate_scale", 1.04))
+        )
+        self.anti_duplicate_contrast = float(self.config.get("anti_duplicate_contrast", 1.03))
+        self.anti_duplicate_saturation = float(self.config.get("anti_duplicate_saturation", 1.05))
+        self.anti_duplicate_speed = float(self.config.get("anti_duplicate_speed", 1.02))
+        if self.anti_duplicate_speed <= 0:
+            self.anti_duplicate_speed = 1.02
+        self.subtitle_factor = 1.0 / self.anti_duplicate_speed
         self.audio_sample_rate = int(self.config.get("audio_sample_rate", 44100))
-        self.font_path = resolve_font_path()
         self.ensure_dirs()
 
     @property
@@ -221,12 +248,7 @@ class FFmpegRenderer:
         return self.cam_x, self.cam_y, self.cam_w, self.cam_h
 
     def ensure_dirs(self) -> None:
-        for directory in (
-            WORKSPACE_TEMP,
-            WORKSPACE_RAW,
-            OUTPUT_EN_DIR,
-            OUTPUT_RU_DIR,
-        ):
+        for directory in (WORKSPACE_TEMP, WORKSPACE_RAW, OUTPUT_ROOT):
             directory.mkdir(parents=True, exist_ok=True)
 
     def probe(self, video_path: Path) -> dict[str, Any]:
@@ -280,9 +302,9 @@ class FFmpegRenderer:
         crop_y = min(crop_y, max(0, source_height - crop_height))
         return crop_width, crop_height, crop_x, crop_y
 
-    def _ass_force_style(self) -> str:
+    def _ass_force_style(self, font_family: str) -> str:
         return (
-            f"FontName={self.font_family},FontSize={self.font_size},"
+            f"FontName={font_family},FontSize={self.font_size},"
             f"PrimaryColour={_hex_to_ass_bgr(self.primary_color)},"
             f"SecondaryColour={_hex_to_ass_bgr(self.primary_color)},"
             "OutlineColour=&H00000000&,BackColour=&H00000000&,"
@@ -290,23 +312,38 @@ class FFmpegRenderer:
             f"MarginL=100,MarginR=100,MarginV={self.margin_v},Encoding=1"
         )
 
-    def _subtitle_filter(self, ass_path: Path) -> str:
-        return f"subtitles='{_filter_path(ass_path)}':force_style='{self._ass_force_style()}'"
+    def _font_family_for(self, lang_code: str | None) -> str:
+        code = normalize_language(lang_code)
+        if code in CJK_FONT_FAMILIES and any(
+            Path(path).exists() for path in CJK_FONT_CANDIDATES
+        ):
+            return CJK_FONT_FAMILIES[code]
+        return self.font_family
+
+    def _subtitle_filter(self, ass_path: Path, font_family: str) -> str:
+        return (
+            f"subtitles='{_filter_path(ass_path)}':"
+            f"force_style='{self._ass_force_style(font_family)}'"
+        )
 
     def write_hook_textfile(self, text: str, suffix: str) -> Path:
         safe_suffix = re.sub(r"[^A-Za-z0-9_.-]+", "_", suffix)
         target = WORKSPACE_TEMP / f"hook_{safe_suffix}.txt"
-        banner = re.sub(r"\s+", " ", text or "").strip() or "GTA VI"
+        banner = re.sub(r"\s+", " ", text or "").strip() or "VIRAL MOMENT"
         target.write_text(banner, encoding="utf-8")
         return target
 
     def build_drawtext_filter(
-        self, hook_file: Path, x_expr: str = "(w-text_w)/2", y_expr: str = "120"
+        self,
+        hook_file: Path,
+        font_path: Path,
+        x_expr: str = "(w-text_w)/2",
+        y_expr: str = "120",
     ) -> str:
         hook_size = self.font_size + 10
         return (
             f"drawtext=textfile='{_filter_path(hook_file)}':"
-            f"fontfile='{_filter_path(Path(self.font_path))}':"
+            f"fontfile='{_filter_path(font_path)}':"
             f"fontsize={hook_size}:fontcolor=white:borderw=3:bordercolor=black:"
             f"x={x_expr}:y={y_expr}:fix_bounds=true:expansion=none"
         )
@@ -315,15 +352,17 @@ class FFmpegRenderer:
         self,
         clip_id: str,
         probe: dict[str, Any],
-        hooks: dict[str, Any],
+        hook_text: str,
         ass_path: Path,
-        lang: str,
+        lang_code: str,
         layout: str,
-    ) -> tuple[str, Path]:
+        apply_uniqueness: bool,
+    ) -> tuple[str, Path, Path]:
         cam_w, cam_h, cam_x, cam_y = self._source_crop(probe)
         game_height = self.height - CAM_PANEL_HEIGHT
-        hook_text = hooks.get("en_hook" if lang == "en" else "ru_hook", "")
-        hook_file = self.write_hook_textfile(hook_text, f"{clip_id}_{lang}")
+        hook_file = self.write_hook_textfile(hook_text, f"{clip_id}_{lang_code}")
+        font_family = self._font_family_for(lang_code)
+        font_path = Path(resolve_font_path(lang_code))
 
         if layout == "blur":
             graph = (
@@ -345,15 +384,19 @@ class FFmpegRenderer:
                 f"[cam][game]overlay=0:{CAM_PANEL_HEIGHT}:format=auto[base]"
             )
 
-        if lang == "ru":
-            zoom_width = _even(self.width * self.ru_scale)
-            zoom_height = _even(self.height * self.ru_scale)
-            adjusted_ass = adjust_ass_timestamps(ass_path, RU_SUBTITLE_FACTOR, suffix="ru")
+        if apply_uniqueness:
+            zoom_width = _even(self.width * self.anti_duplicate_scale)
+            zoom_height = _even(self.height * self.anti_duplicate_scale)
+            adjusted_ass = adjust_ass_timestamps(
+                ass_path, self.subtitle_factor, suffix=f"{lang_code}_uniq"
+            )
+            setpts_factor = f"{self.subtitle_factor:.6f}"
             graph += (
                 f";[base]scale={zoom_width}:{zoom_height},"
                 f"crop={self.width}:{self.height},"
-                f"eq=contrast={self.ru_contrast}:saturation={self.ru_saturation},"
-                f"setpts={RU_SETPTS_FACTOR}*PTS[graded]"
+                f"eq=contrast={self.anti_duplicate_contrast}:"
+                f"saturation={self.anti_duplicate_saturation},"
+                f"setpts={setpts_factor}*PTS[graded]"
             )
             final_ass = adjusted_ass
         else:
@@ -361,36 +404,45 @@ class FFmpegRenderer:
             final_ass = Path(ass_path)
 
         graph += (
-            f";[graded]{self.build_drawtext_filter(hook_file)}[hooked];"
-            f"[hooked]{self._subtitle_filter(final_ass)}[vout]"
+            f";[graded]{self.build_drawtext_filter(hook_file, font_path)}[hooked];"
+            f"[hooked]{self._subtitle_filter(final_ass, font_family)}[vout]"
         )
-        logger.debug("Filtergraph for %s/%s: %s", clip_id, lang, graph)
-        return graph, hook_file
+        logger.debug("Filtergraph for %s/%s: %s", clip_id, lang_code, graph)
+        return graph, hook_file, final_ass
 
     def _run_render(
         self,
         clip_id: str,
         raw_video_path: Path,
-        hooks: dict[str, Any],
+        hook_text: str,
         ass_path: Path,
-        lang: str,
+        lang_code: str,
         layout: str,
+        apply_uniqueness: bool,
     ) -> Path:
         raw_video_path = Path(raw_video_path)
         if not raw_video_path.exists():
             raise FileNotFoundError(f"Raw video not found: {raw_video_path}")
         if not Path(ass_path).exists():
             raise FileNotFoundError(f"Subtitle file not found: {ass_path}")
+        code = validate_language_code(lang_code)
         probe = self.probe(raw_video_path)
         if not probe["width"] or not probe["height"]:
             raise RuntimeError(f"Could not determine video dimensions for {raw_video_path}")
 
-        graph, _hook_file = self._composed_video_filter(
-            clip_id, probe, hooks, Path(ass_path), lang, layout
+        effective_uniqueness = bool(apply_uniqueness and self.anti_duplicate_enabled)
+        graph, _hook_file, _final_ass = self._composed_video_filter(
+            clip_id,
+            probe,
+            hook_text,
+            Path(ass_path),
+            code,
+            layout,
+            effective_uniqueness,
         )
-        output_dir = OUTPUT_EN_DIR if lang == "en" else OUTPUT_RU_DIR
+        output_dir = output_dir_for(code)
         output_dir.mkdir(parents=True, exist_ok=True)
-        output_path = output_dir / f"{clip_id}_{lang}.mp4"
+        output_path = output_dir / f"{clip_id}_{code}.mp4"
 
         command = [
             "ffmpeg",
@@ -421,7 +473,8 @@ class FFmpegRenderer:
             "+faststart",
         ]
         if probe.get("has_audio"):
-            command.extend(["-af", f"atempo={RU_PLAYBACK_SPEED}" if lang == "ru" else "anull"])
+            atempo = self.anti_duplicate_speed if effective_uniqueness else 1.0
+            command.extend(["-af", f"atempo={atempo:.6f}" if atempo != 1.0 else "anull"])
             command.append("-shortest")
         command.append(str(output_path))
 
@@ -432,40 +485,76 @@ class FFmpegRenderer:
         except subprocess.CalledProcessError as exc:
             stderr = (exc.stderr or "").strip().splitlines()
             detail = "\n".join(stderr[-8:]) if stderr else "unknown ffmpeg error"
-            raise RuntimeError(f"ffmpeg render failed for {clip_id}/{lang}:\n{detail}") from exc
-        logger.info("Rendered %s %s -> %s", clip_id, lang.upper(), output_path)
+            raise RuntimeError(
+                f"ffmpeg render failed for {clip_id}/{code}:\n{detail}"
+            ) from exc
+        logger.info(
+            "Rendered %s %s (uniqueness=%s) -> %s",
+            clip_id,
+            code.upper(),
+            effective_uniqueness,
+            output_path,
+        )
         return output_path
 
-    def render_split_screen(
-        self, clip_id: str, raw_video_path: Path, hooks: dict[str, Any], ass_path: Path, lang: str = "en"
-    ) -> Path:
-        return self._run_render(clip_id, raw_video_path, hooks, ass_path, lang, "split")
-
-    def render_blurred_fullscreen(
-        self, clip_id: str, raw_video_path: Path, hooks: dict[str, Any], ass_path: Path, lang: str = "en"
-    ) -> Path:
-        return self._run_render(clip_id, raw_video_path, hooks, ass_path, lang, "blur")
-
-    def process_clip(
+    def render_clip(
         self,
         clip_id: str,
         raw_video_path: Path,
-        hooks: dict[str, Any],
-        ass_paths: dict[str, Path] | Path,
-        layout_mode: str = "split",
-    ) -> dict[str, Path]:
-        """Render both language variants and return their output paths."""
-        if isinstance(ass_paths, dict):
-            ass_en = Path(ass_paths["ass_path_en"])
-            ass_ru = Path(ass_paths["ass_path_ru"])
-        else:
-            ass_en = Path(ass_paths)
-            ass_ru = Path(ass_paths)
-        renderer = self.render_blurred_fullscreen if layout_mode == "blur" else self.render_split_screen
-        return {
-            "en": renderer(clip_id, raw_video_path, hooks, ass_en, lang="en"),
-            "ru": renderer(clip_id, raw_video_path, hooks, ass_ru, lang="ru"),
-        }
+        hook_text: str,
+        ass_path: Path,
+        lang_code: str,
+        layout: str = "split",
+        apply_uniqueness: bool = True,
+    ) -> Path:
+        """Render one language variant to ``output/<lang>/<clip>_<lang>.mp4``."""
+        return self._run_render(
+            clip_id,
+            raw_video_path,
+            hook_text,
+            ass_path,
+            lang_code,
+            layout,
+            apply_uniqueness,
+        )
+
+    def render_split_screen(
+        self,
+        clip_id: str,
+        raw_video_path: Path,
+        hook_text: str,
+        ass_path: Path,
+        lang_code: str = "en",
+        apply_uniqueness: bool = True,
+    ) -> Path:
+        return self.render_clip(
+            clip_id,
+            raw_video_path,
+            hook_text,
+            ass_path,
+            lang_code,
+            layout="split",
+            apply_uniqueness=apply_uniqueness,
+        )
+
+    def render_blurred_fullscreen(
+        self,
+        clip_id: str,
+        raw_video_path: Path,
+        hook_text: str,
+        ass_path: Path,
+        lang_code: str = "en",
+        apply_uniqueness: bool = True,
+    ) -> Path:
+        return self.render_clip(
+            clip_id,
+            raw_video_path,
+            hook_text,
+            ass_path,
+            lang_code,
+            layout="blur",
+            apply_uniqueness=apply_uniqueness,
+        )
 
     def extract_middle_frame(self, video_path: Path) -> Path:
         video_path = Path(video_path)
@@ -491,7 +580,7 @@ class FFmpegRenderer:
 
     def _load_font(self, size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
         try:
-            return ImageFont.truetype(self.font_path, size=size)
+            return ImageFont.truetype(resolve_font_path(), size=size)
         except OSError:
             return ImageFont.load_default()
 
@@ -516,7 +605,9 @@ class FFmpegRenderer:
         new_size = (max(1, round(image.width * ratio)), max(1, round(image.height * ratio)))
         return image.resize(new_size, Image.Resampling.LANCZOS)
 
-    def preview_source(self, frame_path: Path, cam_box: tuple[float, float, float, float]) -> Image.Image:
+    def preview_source(
+        self, frame_path: Path, cam_box: tuple[float, float, float, float]
+    ) -> Image.Image:
         """Original frame with green webcam and blue gameplay rectangles."""
         image = Image.open(frame_path).convert("RGB")
         draw = ImageDraw.Draw(image)
@@ -536,6 +627,7 @@ class FFmpegRenderer:
         frame_path: Path,
         cam_box: tuple[float, float, float, float],
         layout: str = "split",
+        hook_text: str = "VIRAL MOMENT",
     ) -> Image.Image:
         """Render a 1080x1920 style preview with hook and subtitle placeholders."""
         source = Image.open(frame_path).convert("RGB")
@@ -573,11 +665,11 @@ class FFmpegRenderer:
         draw = ImageDraw.Draw(canvas)
         hook_font = self._load_font(self.font_size + 12)
         subtitle_font = self._load_font(self.font_size)
-        hook_text = "GTA VI MOMENT"
-        hook_width = draw.textbbox((0, 0), hook_text, font=hook_font)[2]
+        safe_hook = re.sub(r"\s+", " ", hook_text or "").strip() or "VIRAL MOMENT"
+        hook_width = draw.textbbox((0, 0), safe_hook, font=hook_font)[2]
         draw.text(
             ((self.width - hook_width) / 2, 110),
-            hook_text,
+            safe_hook,
             font=hook_font,
             fill=(255, 255, 255),
             stroke_width=4,
@@ -600,12 +692,20 @@ class FFmpegRenderer:
 def render_clip(
     clip_id: str,
     raw_video_path: Path,
-    hooks: dict[str, Any],
-    ass_paths: dict[str, Path] | Path,
+    hook_text: str,
+    ass_path: Path,
+    lang_code: str = "en",
     layout_mode: str = "split",
     preset_name: str = "default",
-) -> dict[str, Path]:
+    apply_uniqueness: bool = True,
+) -> Path:
     """Convenience wrapper used by the UI and smoke tests."""
-    return FFmpegRenderer(preset_name=preset_name).process_clip(
-        clip_id, raw_video_path, hooks, ass_paths, layout_mode=layout_mode
+    return FFmpegRenderer(preset_name=preset_name).render_clip(
+        clip_id,
+        raw_video_path,
+        hook_text,
+        ass_path,
+        lang_code,
+        layout=layout_mode,
+        apply_uniqueness=apply_uniqueness,
     )

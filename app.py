@@ -1,7 +1,7 @@
-"""GTA6 Clip Factory — Streamlit studio.
+"""ClipForge Studio — open-source multi-game, multi-language clip studio.
 
-Run with ``streamlit run app.py``.  All expensive operations are triggered
-explicitly from the UI; importing this module has no Streamlit side effects.
+Run with ``streamlit run app.py``.  Importing this module has no Streamlit side
+effects, so the synthetic smoke test can reuse the pipeline helpers directly.
 """
 
 from __future__ import annotations
@@ -23,18 +23,21 @@ from dotenv import load_dotenv, set_key
 from PIL import Image
 
 from src.fetcher import ClipFetcher, fetch_twitch_clips, load_processed_clips
-from src.renderer import (
-    FFmpegRenderer,
-    load_presets,
-    save_preset,
+from src.languages import (
+    language_badge,
+    language_name,
+    normalize_language,
+    supported_languages_from_config,
 )
-from src.transcriber import SubtitleProcessor
+from src.renderer import FFmpegRenderer, load_presets, save_preset
+from src.transcriber import SubtitleProcessor, build_template_metadata
 from src.transcriber import load_config as load_base_config
 from src.uploader import (
     CLIENT_SECRETS_FILE,
-    TOKEN_FILES,
     YouTubeUploader,
     authorize_channel,
+    get_token_path,
+    list_connected_languages,
 )
 
 logger = logging.getLogger(__name__)
@@ -45,30 +48,63 @@ ENV_PATH = PROJECT_ROOT / ".env"
 DATA_DIR = PROJECT_ROOT / "data"
 RAW_DIR = PROJECT_ROOT / "workspace" / "raw"
 TEMP_DIR = PROJECT_ROOT / "workspace" / "temp"
-OUTPUT_EN_DIR = PROJECT_ROOT / "output" / "en"
-OUTPUT_RU_DIR = PROJECT_ROOT / "output" / "ru"
+OUTPUT_ROOT = PROJECT_ROOT / "output"
 
 HAS_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 WHISPER_AVAILABLE = importlib.util.find_spec("faster_whisper") is not None
 
-EN_PINNED_COMMENT = (
-    "Which moment was your favourite? Tell us below.\n"
-    "More daily GTA VI clips: https://t.me/gta6clipfactory"
-)
-RU_PINNED_COMMENT = (
-    "Больше клипов и эксклюзивов — в нашем Telegram: https://t.me/gta6clipfactory\n"
-    "Подпишись, чтобы не пропустить новые Shorts!"
-)
+ALL_LANGUAGES = "__all__"
+CUSTOM_LANGUAGE = "__custom__"
+GAME_PRESETS = [
+    "Grand Theft Auto VI",
+    "Counter-Strike 2",
+    "Valorant",
+    "Dota 2",
+    "Minecraft",
+    "Just Chatting",
+]
 MANUAL_TITLE = "Manual clip"
 
 
 def ensure_runtime_dirs() -> None:
-    for directory in (DATA_DIR, RAW_DIR, TEMP_DIR, OUTPUT_EN_DIR, OUTPUT_RU_DIR):
+    for directory in (DATA_DIR, RAW_DIR, TEMP_DIR, OUTPUT_ROOT):
         directory.mkdir(parents=True, exist_ok=True)
 
 
 def load_config() -> dict[str, Any]:
     return load_base_config()
+
+
+def _supported_languages() -> list[str]:
+    return supported_languages_from_config(load_config())
+
+
+def _language_label(code: str) -> str:
+    return f"{language_name(code)} ({code.upper()})"
+
+
+def _game_preset_options() -> list[str]:
+    default_game = str(load_config().get("default_game") or GAME_PRESETS[0]).strip()
+    options: list[str] = []
+    for name in [default_game, *GAME_PRESETS]:
+        if name and name not in options:
+            options.append(name)
+    return options
+
+
+def _apply_game_preset() -> None:
+    st.session_state.game_name_control = st.session_state.game_preset_control
+
+
+def _active_pipeline_language() -> str:
+    config = load_config()
+    default = normalize_language(config.get("default_language")) or "en"
+    choice = st.session_state.get("fetch_language_choice")
+    if choice == CUSTOM_LANGUAGE:
+        return normalize_language(st.session_state.get("custom_language_code")) or default
+    if not choice or choice == ALL_LANGUAGES:
+        return default
+    return normalize_language(choice) or default
 
 
 def _style_config() -> dict[str, Any]:
@@ -86,18 +122,25 @@ def _style_config() -> dict[str, Any]:
 
 
 def _init_state() -> None:
+    config = load_config()
+    preset_options = _game_preset_options()
+    default_game = str(config.get("default_game") or preset_options[0]).strip()
     defaults: dict[str, Any] = {
         "clip_queue": [],
         "render_results": {},
         "layout_mode": "split",
-        "font_size_control": load_config()["font_size"],
-        "primary_color_control": load_config()["primary_color"],
-        "outline_control": load_config()["outline_thickness"],
-        "margin_v_control": load_config()["margin_v"],
+        "font_size_control": config["font_size"],
+        "primary_color_control": config["primary_color"],
+        "outline_control": config["outline_thickness"],
+        "margin_v_control": config["margin_v"],
         "schedule_interval": 24,
         "schedule_slot": 0,
         "schedule_date": (datetime.now(UTC) + timedelta(days=1)).date(),
         "schedule_time": time(18, 0),
+        "game_name_control": default_game,
+        "game_preset_control": default_game if default_game in preset_options else preset_options[0],
+        "pipeline_language": normalize_language(config.get("default_language")) or "en",
+        "render_uniqueness": bool(config.get("anti_duplicate_enabled", True)),
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -106,7 +149,6 @@ def _init_state() -> None:
 
 def clip_id_from_url(url: str) -> str:
     parsed = urlparse(url.strip())
-    candidate = ""
     if "youtube" in parsed.netloc and "v" in parse_qs(parsed.query):
         candidate = parse_qs(parsed.query)["v"][0]
     else:
@@ -126,6 +168,16 @@ def find_streamer(clip_id: str) -> str:
     return ""
 
 
+def find_clip_language(clip_id: str) -> str:
+    for clip in st.session_state.get("clip_queue", []):
+        if str(clip.get("id")) == clip_id:
+            return normalize_language(clip.get("language")) or ""
+    for clip in load_processed_clips():
+        if str(clip.get("id")) == clip_id:
+            return normalize_language(clip.get("language")) or ""
+    return ""
+
+
 def _preset_for_clip(clip_id: str) -> str:
     presets = load_presets()
     streamer = find_streamer(clip_id)
@@ -133,7 +185,8 @@ def _preset_for_clip(clip_id: str) -> str:
 
 
 def _cam_box_for_clip(clip_id: str) -> tuple[float, float, float, float]:
-    preset = load_presets().get(_preset_for_clip(clip_id), load_presets()["default"])
+    presets = load_presets()
+    preset = presets.get(_preset_for_clip(clip_id), presets["default"])
     return (
         float(st.session_state.get(f"cam_x_{clip_id}", preset["cam_x"])),
         float(st.session_state.get(f"cam_y_{clip_id}", preset["cam_y"])),
@@ -145,57 +198,63 @@ def _cam_box_for_clip(clip_id: str) -> tuple[float, float, float, float]:
 def run_clip_pipeline(
     clip_id: str,
     raw_path: Path,
+    source_lang: str | None = None,
+    target_lang: str | None = None,
+    game_name: str = "",
     layout_mode: str = "split",
     preset_name: str = "default",
     cam_box: tuple[float, float, float, float] | None = None,
     config: dict[str, Any] | None = None,
     progress: Any = None,
+    apply_uniqueness: bool = True,
 ) -> dict[str, Any]:
-    """Transcribe, translate, then render EN and RU variants for one clip."""
+    """Transcribe, localise and render every requested language variant."""
     active_config = dict(config or load_config())
+    default_language = normalize_language(active_config.get("default_language")) or "en"
+    source = normalize_language(source_lang) or default_language
+    game = str(game_name or active_config.get("default_game") or "").strip()
     processor = SubtitleProcessor(active_config)
-    subtitle_data = processor.process(Path(raw_path), clip_id, progress=progress)
-    hooks = {
-        "en_hook": subtitle_data["en_hook"],
-        "ru_hook": subtitle_data["ru_hook"],
-    }
+    subtitle_data = processor.process(
+        Path(raw_path),
+        clip_id,
+        source_lang=source,
+        target_lang=target_lang,
+        game_name=game,
+        progress=progress,
+    )
     renderer = FFmpegRenderer(
         preset_name=preset_name,
         cam_box=cam_box,
         config=active_config,
     )
-    if progress:
-        progress("Rendering EN version...")
-    en_path = (
-        renderer.render_blurred_fullscreen(
-            clip_id, Path(raw_path), hooks, Path(subtitle_data["ass_path_en"]), lang="en"
+    outputs: dict[str, Path] = {}
+    hooks: dict[str, str] = {}
+    for lang_code, variant in subtitle_data.get("variants", {}).items():
+        if progress:
+            progress(f"Rendering {lang_code.upper()} version...")
+        metadata = dict(variant.get("metadata") or {})
+        output_path = renderer.render_clip(
+            clip_id,
+            Path(raw_path),
+            str(metadata.get("hook") or ""),
+            Path(variant["ass_path"]),
+            lang_code,
+            layout=layout_mode,
+            apply_uniqueness=apply_uniqueness,
         )
-        if layout_mode == "blur"
-        else renderer.render_split_screen(
-            clip_id, Path(raw_path), hooks, Path(subtitle_data["ass_path_en"]), lang="en"
-        )
-    )
-    if progress:
-        progress("Rendering RU version with fingerprint filters...")
-    ru_path = (
-        renderer.render_blurred_fullscreen(
-            clip_id, Path(raw_path), hooks, Path(subtitle_data["ass_path_ru"]), lang="ru"
-        )
-        if layout_mode == "blur"
-        else renderer.render_split_screen(
-            clip_id, Path(raw_path), hooks, Path(subtitle_data["ass_path_ru"]), lang="ru"
-        )
-    )
+        outputs[lang_code] = output_path
+        hooks[lang_code] = str(metadata.get("hook") or "")
+        variant["output_path"] = str(output_path)
     result = dict(subtitle_data)
     result.update(
         {
-            "en": en_path,
-            "ru": ru_path,
+            "outputs": outputs,
             "hooks": hooks,
             "layout_mode": layout_mode,
             "preset": preset_name,
             "cam_box": cam_box or renderer.cam_box,
             "raw_path": str(raw_path),
+            "game_name": game,
         }
     )
     return result
@@ -206,12 +265,20 @@ def generate_synthetic_test_clip(
     progress: Any = None,
     layout_mode: str | None = None,
     cam_box: tuple[float, float, float, float] | None = None,
+    language: str | None = None,
+    target_lang: str | None = None,
+    game_name: str | None = None,
+    clip_id: str = "synth_test",
 ) -> dict[str, Any]:
-    """Create a five-second 1280x720 clip and run the complete pipeline."""
+    """Create a five-second test clip and run the selected-language pipeline."""
     ensure_runtime_dirs()
     if not HAS_FFMPEG:
         raise RuntimeError("ffmpeg and ffprobe must be installed before running the test.")
-    raw_path = RAW_DIR / "synth_test.mp4"
+    active_config = dict(config or load_config())
+    active_language = normalize_language(language) or normalize_language(
+        active_config.get("default_language")
+    ) or "en"
+    raw_path = RAW_DIR / f"{clip_id}.mp4"
     if progress:
         progress("Generating 5s testsrc + sine synthetic clip...")
     command = [
@@ -240,12 +307,14 @@ def generate_synthetic_test_clip(
         subprocess.run(command, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(f"Synthetic clip generation failed: {(exc.stderr or '').strip()}") from exc
-    active_config = dict(config or load_config())
     active_layout = layout_mode or st.session_state.get("layout_mode", "split")
-    active_cam_box = cam_box if cam_box is not None else _cam_box_for_clip("synth_test")
+    active_cam_box = cam_box if cam_box is not None else _cam_box_for_clip(clip_id)
     return run_clip_pipeline(
-        "synth_test",
+        clip_id,
         raw_path,
+        source_lang=active_language,
+        target_lang=target_lang,
+        game_name=game_name or str(active_config.get("default_game") or ""),
         layout_mode=active_layout,
         preset_name="default",
         cam_box=active_cam_box,
@@ -302,8 +371,8 @@ def _format_duration(seconds: Any) -> str:
     return f"{total // 60}:{total % 60:02d}"
 
 
-def _load_translation_payload(clip_id: str) -> dict[str, Any]:
-    path = TEMP_DIR / f"{clip_id}_translation.json"
+def _load_localization_payload(clip_id: str) -> dict[str, Any]:
+    path = TEMP_DIR / f"{clip_id}_localization.json"
     if not path.exists():
         return {}
     try:
@@ -314,32 +383,47 @@ def _load_translation_payload(clip_id: str) -> dict[str, Any]:
 
 
 def collect_render_results() -> dict[str, dict[str, Any]]:
-    results: dict[str, dict[str, Any]] = {}
-    for clip_id, result in st.session_state.get("render_results", {}).items():
-        results[clip_id] = dict(result)
-    discovered: set[str] = set()
-    for directory, suffix in ((OUTPUT_EN_DIR, "_en"), (OUTPUT_RU_DIR, "_ru")):
-        for path in directory.glob("*.mp4"):
-            if path.stem.endswith(suffix):
-                discovered.add(path.stem[: -len(suffix)])
-    for clip_id in discovered:
-        if clip_id in results:
+    """Merge session results with outputs discovered under output/<lang>/."""
+    results: dict[str, dict[str, Any]] = {
+        clip_id: dict(result)
+        for clip_id, result in st.session_state.get("render_results", {}).items()
+    }
+    discovered: dict[str, set[str]] = {}
+    for path in OUTPUT_ROOT.glob("*/*.mp4"):
+        lang = normalize_language(path.parent.name)
+        if not lang:
             continue
-        payload = _load_translation_payload(clip_id)
-        results[clip_id] = {
-            "en": OUTPUT_EN_DIR / f"{clip_id}_en.mp4",
-            "ru": OUTPUT_RU_DIR / f"{clip_id}_ru.mp4",
-            "ass_path_en": TEMP_DIR / f"{clip_id}_en.ass",
-            "ass_path_ru": TEMP_DIR / f"{clip_id}_ru.ass",
-            "hooks": {
-                "en_hook": payload.get("en_hook", "GTA VI MOMENT"),
-                "ru_hook": payload.get("ru_hook", "МОМЕНТ ИЗ GTA VI"),
-            },
-            "layout_mode": "split",
-            "preset": "default",
-            "cam_box": (0.0, 0.0, 0.2, 0.25),
-            "raw_path": str(RAW_DIR / f"{clip_id}.mp4"),
-        }
+        suffix = f"_{lang}"
+        if not path.stem.endswith(suffix):
+            continue
+        clip_id = path.stem[: -len(suffix)]
+        discovered.setdefault(clip_id, set()).add(lang)
+
+    default_game = str(load_config().get("default_game") or "")
+    for clip_id, languages in discovered.items():
+        existing = results.get(clip_id, {})
+        payload = _load_localization_payload(clip_id)
+        variants = dict(existing.get("variants") or payload.get("variants") or {})
+        for lang in languages:
+            variant = dict(variants.get(lang) or {})
+            variant.setdefault("lang", lang)
+            variant.setdefault("ass_path", str(TEMP_DIR / f"{clip_id}_{lang}.ass"))
+            variant.setdefault(
+                "metadata",
+                build_template_metadata(
+                    lang, payload.get("game_name") or default_game, ""
+                ),
+            )
+            variant["output_path"] = str(OUTPUT_ROOT / lang / f"{clip_id}_{lang}.mp4")
+            variants[lang] = variant
+        merged = dict(payload)
+        merged.update(existing)
+        merged["variants"] = variants
+        merged.setdefault("clip_id", clip_id)
+        merged.setdefault("game_name", payload.get("game_name") or default_game)
+        merged.setdefault("raw_path", str(RAW_DIR / f"{clip_id}.mp4"))
+        merged.setdefault("layout_mode", "split")
+        results[clip_id] = merged
     return results
 
 
@@ -353,6 +437,7 @@ def _cached_previews(
     primary_color: str,
     outline: int,
     margin_v: int,
+    hook_text: str,
 ) -> tuple[Image.Image, Image.Image]:
     config = load_config()
     config.update(
@@ -367,13 +452,13 @@ def _cached_previews(
     frame_path = renderer.extract_middle_frame(Path(path_str))
     return (
         renderer.preview_source(frame_path, cam_box),
-        renderer.preview_composite(frame_path, cam_box, layout),
+        renderer.preview_composite(frame_path, cam_box, layout, hook_text),
     )
 
 
 def render_sidebar_health() -> None:
-    st.sidebar.title("GTA6 Clip Factory")
-    st.sidebar.caption("Vertical Shorts / TikTok studio")
+    st.sidebar.title("ClipForge Studio")
+    st.sidebar.caption("Open-source multi-game vertical clip studio")
     st.sidebar.subheader("System health")
     if HAS_FFMPEG:
         st.sidebar.success("FFmpeg / ffprobe: OK")
@@ -385,6 +470,10 @@ def render_sidebar_health() -> None:
     else:
         st.sidebar.error("faster-whisper: not installed")
     st.sidebar.metric("Processed clips", len(load_processed_clips()))
+    active_language = _active_pipeline_language()
+    st.sidebar.caption(
+        f"Pipeline language: {language_badge(active_language)} {language_name(active_language)}"
+    )
     st.sidebar.divider()
     st.sidebar.subheader("Zero-key verification")
     if st.sidebar.button("Generate Synthetic Test Clip", width="stretch"):
@@ -393,16 +482,69 @@ def render_sidebar_health() -> None:
         else:
             with st.sidebar.status("Running synthetic pipeline...", expanded=True) as status:
                 try:
-                    result = generate_synthetic_test_clip(progress=status.write)
+                    result = generate_synthetic_test_clip(
+                        progress=status.write, language=active_language
+                    )
                     st.session_state.render_results["synth_test"] = result
-                    status.update(label="Synthetic EN + RU renders complete", state="complete")
+                    status.update(
+                        label=f"Synthetic {active_language.upper()} render complete",
+                        state="complete",
+                    )
                 except (RuntimeError, FileNotFoundError, ValueError, OSError) as exc:
                     status.update(label="Synthetic pipeline failed", state="error")
                     st.sidebar.error(str(exc))
 
 
 def tab_fetch_and_queue() -> None:
-    st.header("Збір кліпів")
+    st.header("Fetch & Queue")
+    st.caption("Step 1 chooses the language, Step 2 chooses the game, then fetch or paste URLs.")
+    language_col, game_col = st.columns(2)
+    with language_col:
+        st.subheader("Step 1 · Language")
+        options = [ALL_LANGUAGES, *_supported_languages(), CUSTOM_LANGUAGE]
+
+        def _format_language(value: str) -> str:
+            if value == ALL_LANGUAGES:
+                return "All languages"
+            if value == CUSTOM_LANGUAGE:
+                return "Custom ISO code…"
+            return _language_label(value)
+
+        choice = st.selectbox(
+            "Clip language",
+            options,
+            key="fetch_language_choice",
+            format_func=_format_language,
+        )
+        custom_code = ""
+        if choice == CUSTOM_LANGUAGE:
+            custom_code = st.text_input(
+                "Custom ISO 639-1 code", value="en", key="custom_language_code"
+            )
+        selected_language = None
+        if choice == CUSTOM_LANGUAGE:
+            selected_language = normalize_language(custom_code)
+            if not selected_language:
+                st.warning("Enter a valid 2–3 letter language code, for example 'uk'.")
+        elif choice != ALL_LANGUAGES:
+            selected_language = normalize_language(choice)
+        st.session_state.pipeline_language = (
+            selected_language or _active_pipeline_language()
+        )
+
+    with game_col:
+        st.subheader("Step 2 · Game")
+        preset_options = _game_preset_options()
+        if st.session_state.get("game_preset_control") not in preset_options:
+            st.session_state.game_preset_control = preset_options[0]
+        st.selectbox(
+            "Quick-select game",
+            preset_options,
+            key="game_preset_control",
+            on_change=_apply_game_preset,
+        )
+        game_name = st.text_input("Game name", key="game_name_control")
+
     manual_col, twitch_col = st.columns(2)
     with manual_col:
         st.subheader("Manual URLs")
@@ -432,6 +574,8 @@ def tab_fetch_and_queue() -> None:
                         "views": 0,
                         "duration": 0,
                         "source": "manual",
+                        "language": selected_language or "",
+                        "game": game_name,
                     }
                 )
                 known.add(clip_id)
@@ -444,16 +588,20 @@ def tab_fetch_and_queue() -> None:
 
     with twitch_col:
         st.subheader("Twitch auto-fetcher")
-        game_name = st.text_input("Game name", value="Grand Theft Auto VI", key="game_name")
         timeframe = st.selectbox("Timeframe", ["24h", "7d", "30d"], index=1, key="timeframe")
-        limit = st.number_input("Clip limit", min_value=1, max_value=20, value=10, key="clip_limit")
+        limit = st.number_input(
+            "Clip limit", min_value=1, max_value=50, value=10, key="clip_limit"
+        )
         if st.button("Fetch Top Clips", width="stretch"):
             if not (os.getenv("TWITCH_CLIENT_ID") and os.getenv("TWITCH_CLIENT_SECRET")):
                 st.warning("Set TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET in Settings first.")
             else:
-                with st.spinner("Querying Twitch Helix..."):
+                with st.spinner("Querying Twitch Helix and filtering by language..."):
                     clips = fetch_twitch_clips(
-                        game_name=game_name, first=int(limit), period=str(timeframe)
+                        game_name=game_name,
+                        first=int(limit),
+                        period=str(timeframe),
+                        language=selected_language,
                     )
                 queue = list(st.session_state.clip_queue)
                 known = {str(clip.get("id")) for clip in queue}
@@ -467,8 +615,14 @@ def tab_fetch_and_queue() -> None:
                 st.session_state.clip_queue = queue
                 if added:
                     st.success(f"Added {added} Twitch clip(s).")
+                    if selected_language and added < int(limit):
+                        st.info(
+                            f"Twitch only returned {added} clips in "
+                            f"{language_badge(selected_language)} after scanning up to "
+                            "1000 candidates."
+                        )
                 else:
-                    st.info("No new clips returned. Check credentials or the game name.")
+                    st.info("No new clips returned. Check credentials, game name or language.")
 
     st.divider()
     st.subheader("Interactive clip queue")
@@ -490,8 +644,12 @@ def tab_fetch_and_queue() -> None:
                 else:
                     st.caption("No thumbnail")
             with cols[1]:
-                st.markdown(f"**{clip.get('title') or 'Untitled clip'}**")
+                st.markdown(
+                    f"**{clip.get('title') or 'Untitled clip'}** "
+                    f"{language_badge(clip.get('language'))}"
+                )
                 st.caption(
+                    f"Game: {clip.get('game') or game_name or 'unknown'} | "
                     f"Streamer: {clip.get('streamer') or 'unknown'} | "
                     f"Source: {clip.get('source') or 'manual'}"
                 )
@@ -534,7 +692,7 @@ def tab_fetch_and_queue() -> None:
 
 
 def tab_crop_style_studio() -> None:
-    st.header("Рамка вебкамери та стиль")
+    st.header("Crop & Style")
     raw_files = sorted(RAW_DIR.glob("*.mp4"), key=lambda item: item.stat().st_mtime, reverse=True)
     if not raw_files:
         st.info("Download clips in the first tab or generate the synthetic test clip.")
@@ -578,7 +736,9 @@ def tab_crop_style_studio() -> None:
         "Layout mode",
         ["split", "blur"],
         format_func=lambda value: (
-            "Split-Screen (Webcam + Gameplay)" if value == "split" else "Full-Screen 9:16 with Blurred BG"
+            "Split-Screen (Webcam + Gameplay)"
+            if value == "split"
+            else "Full-Screen 9:16 with Blurred BG"
         ),
         horizontal=True,
         key="layout_mode",
@@ -598,6 +758,12 @@ def tab_crop_style_studio() -> None:
     config = _style_config()
     cam_box = (cam_x, cam_y, cam_w, cam_h)
     source_path = RAW_DIR / selected_label
+    preview_language = _active_pipeline_language()
+    preview_hook = build_template_metadata(
+        preview_language,
+        str(config.get("default_game") or ""),
+        "",
+    )["hook"]
     st.subheader("Live visual preview")
     try:
         source_image, composite_image = _cached_previews(
@@ -609,6 +775,7 @@ def tab_crop_style_studio() -> None:
             str(config["primary_color"]),
             int(config["outline_thickness"]),
             int(config["margin_v"]),
+            preview_hook,
         )
         left, right = st.columns(2)
         with left:
@@ -638,62 +805,53 @@ def tab_crop_style_studio() -> None:
             st.success(f"Preset '{preset_streamer}' saved to presets.json.")
 
 
-def _default_title(clip_id: str, language: str, hook: str) -> str:
-    headline = hook.strip() or ("GTA VI момент" if language == "ru" else "GTA VI moment")
-    if language == "ru":
-        return f"{headline} | GTA VI #Shorts"[:100]
-    return f"GTA VI: {headline} #Shorts"[:100]
-
-
-def _default_description(language: str, hook: str) -> str:
-    if language == "ru":
-        return (
-            f"{hook}\n\n"
-            "Клип из GTA VI в вертикальном формате. Подпишись, чтобы не пропустить новые Shorts!\n"
-            "#GTA6 #Shorts #Игры #Gaming"
-        )
-    return (
-        f"{hook}\n\n"
-        "Vertical GTA VI clip. Subscribe for daily Shorts and viral moments!\n"
-        "#GTA6 #Shorts #Gaming #Viral"
+def _render_variant_panel(
+    clip_id: str,
+    lang_code: str,
+    variant: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    metadata = dict(variant.get("metadata") or {})
+    fallback = build_template_metadata(
+        lang_code, str(result.get("game_name") or ""), ""
     )
+    for key, value in fallback.items():
+        metadata.setdefault(key, value)
 
-
-def _render_language_panel(clip_id: str, language: str, result: dict[str, Any]) -> None:
-    hook_key = "en_hook" if language == "en" else "ru_hook"
-    hooks = dict(result.get("hooks") or {})
-    default_hook = str(hooks.get(hook_key) or "")
-    video_path = result.get(language)
+    st.markdown(f"#### {language_name(lang_code)} {language_badge(lang_code)}")
+    video_path = variant.get("output_path") or (
+        result.get("outputs", {}) or {}
+    ).get(lang_code)
     if video_path and Path(video_path).exists():
         st.video(str(video_path))
     else:
-        st.info(f"{language.upper()} render is not available yet.")
+        st.info(f"{lang_code.upper()} render is not available yet.")
 
     hook_value = st.text_input(
         "Hook Banner Text",
-        value=default_hook,
-        key=f"hook_{clip_id}_{language}",
+        value=str(metadata.get("hook") or ""),
+        key=f"hook_{clip_id}_{lang_code}",
     )
     title_value = st.text_input(
         "Video Title",
-        value=_default_title(clip_id, language, default_hook),
-        key=f"title_{clip_id}_{language}",
+        value=str(metadata.get("title") or ""),
+        key=f"title_{clip_id}_{lang_code}",
     )
     description_value = st.text_area(
         "Description & Hashtags",
-        value=_default_description(language, default_hook),
+        value=str(metadata.get("description") or ""),
         height=130,
-        key=f"description_{clip_id}_{language}",
+        key=f"description_{clip_id}_{lang_code}",
     )
     comment_value = st.text_area(
         "Pinned Comment CTA",
-        value=EN_PINNED_COMMENT if language == "en" else RU_PINNED_COMMENT,
+        value=str(metadata.get("cta") or ""),
         height=90,
-        key=f"comment_{clip_id}_{language}",
+        key=f"comment_{clip_id}_{lang_code}",
     )
 
     action_cols = st.columns(3)
-    if action_cols[0].button("Re-render Hook Text", key=f"rerender_{clip_id}_{language}"):
+    if action_cols[0].button("Re-render Hook Text", key=f"rerender_{clip_id}_{lang_code}"):
         try:
             config = _style_config()
             renderer = FFmpegRenderer(
@@ -701,39 +859,47 @@ def _render_language_panel(clip_id: str, language: str, result: dict[str, Any]) 
                 cam_box=result.get("cam_box"),
                 config=config,
             )
-            updated_hooks = dict(hooks)
-            updated_hooks[hook_key] = hook_value
             ass_path = Path(
-                result.get(f"ass_path_{language}") or TEMP_DIR / f"{clip_id}_{language}.ass"
+                variant.get("ass_path") or TEMP_DIR / f"{clip_id}_{lang_code}.ass"
             )
-            layout = str(result.get("layout_mode", "split"))
-            render_call = (
-                renderer.render_blurred_fullscreen
-                if layout == "blur"
-                else renderer.render_split_screen
-            )
-            new_path = render_call(
+            new_path = renderer.render_clip(
                 clip_id,
                 Path(result.get("raw_path") or RAW_DIR / f"{clip_id}.mp4"),
-                updated_hooks,
+                hook_value,
                 ass_path,
-                lang=language,
+                lang_code,
+                layout=str(result.get("layout_mode", "split")),
+                apply_uniqueness=bool(st.session_state.get("render_uniqueness", True)),
             )
+            updated_metadata = {
+                **metadata,
+                "hook": hook_value,
+                "title": title_value,
+                "description": description_value,
+                "cta": comment_value,
+            }
             stored = st.session_state.render_results.setdefault(clip_id, dict(result))
-            stored[language] = new_path
-            stored["hooks"] = updated_hooks
-            st.success(f"{language.upper()} hook re-rendered.")
+            variants = dict(stored.get("variants") or result.get("variants") or {})
+            variant_update = dict(variants.get(lang_code) or variant)
+            variant_update["output_path"] = str(new_path)
+            variant_update["metadata"] = updated_metadata
+            variants[lang_code] = variant_update
+            stored["variants"] = variants
+            outputs = dict(stored.get("outputs") or {})
+            outputs[lang_code] = new_path
+            stored["outputs"] = outputs
+            st.success(f"{lang_code.upper()} hook re-rendered.")
         except (RuntimeError, FileNotFoundError, ValueError, OSError) as exc:
             st.error(f"Re-render failed: {exc}")
 
-    if action_cols[1].button("Open Output Folder", key=f"open_{clip_id}_{language}"):
-        folder = OUTPUT_EN_DIR if language == "en" else OUTPUT_RU_DIR
+    if action_cols[1].button("Open Output Folder", key=f"open_{clip_id}_{lang_code}"):
+        folder = OUTPUT_ROOT / lang_code
         if open_output_folder(folder):
             st.success(f"Opened {folder}")
         else:
             st.error("Could not launch xdg-open. Folder: " + str(folder))
 
-    if action_cols[2].button("Schedule to YouTube", key=f"schedule_{clip_id}_{language}"):
+    if action_cols[2].button("Schedule to YouTube", key=f"schedule_{clip_id}_{lang_code}"):
         if not video_path or not Path(video_path).exists():
             st.error("Render the video before scheduling it.")
         else:
@@ -742,7 +908,7 @@ def _render_language_panel(clip_id: str, language: str, result: dict[str, Any]) 
                 Path(video_path),
                 title_value,
                 description_value + "\n\n" + comment_value,
-                language=language,
+                language=lang_code,
                 start_time=_scheduled_start(),
                 interval_hours=int(st.session_state.get("schedule_interval", 24)),
                 slot_index=int(st.session_state.get("schedule_slot", 0)),
@@ -754,18 +920,24 @@ def _render_language_panel(clip_id: str, language: str, result: dict[str, Any]) 
 
 
 def render_clip_gallery(clip_id: str, result: dict[str, Any]) -> None:
-    with st.expander(f"Clip {clip_id}", expanded=True):
-        en_col, ru_col = st.columns(2)
-        with en_col:
-            st.markdown("### English Version (EN)")
-            _render_language_panel(clip_id, "en", result)
-        with ru_col:
-            st.markdown("### Russian Version (RU)")
-            _render_language_panel(clip_id, "ru", result)
+    game = str(result.get("game_name") or "")
+    with st.expander(f"Clip {clip_id}" + (f" · {game}" if game else ""), expanded=True):
+        variants = result.get("variants") or {}
+        if not variants:
+            st.info("No language variants are available for this clip yet.")
+            return
+        languages = list(variants)
+        for start in range(0, len(languages), 2):
+            columns = st.columns(2)
+            for column, lang_code in zip(columns, languages[start : start + 2], strict=False):
+                with column:
+                    _render_variant_panel(
+                        clip_id, lang_code, dict(variants[lang_code]), result
+                    )
 
 
 def tab_batch_render() -> None:
-    st.header("Рендер та перевірка")
+    st.header("Batch Render & Preview")
     raw_files = sorted(RAW_DIR.glob("*.mp4"), key=lambda item: item.stat().st_mtime, reverse=True)
     if not raw_files:
         st.info("No clips in workspace/raw. Download or generate a test clip first.")
@@ -773,19 +945,51 @@ def tab_batch_render() -> None:
 
     labels = [path.name for path in raw_files]
     selected = st.multiselect(
-        "Clips to render (EN + RU)",
+        "Clips to render",
         labels,
         default=labels,
         key="batch_selection",
+    )
+    codes = _supported_languages()
+    config = load_config()
+    default_language = normalize_language(config.get("default_language")) or "en"
+    fallback_index = codes.index(default_language) if default_language in codes else 0
+    control_cols = st.columns(3)
+    with control_cols[0]:
+        fallback_language = st.selectbox(
+            "Fallback language for clips without metadata",
+            codes,
+            index=fallback_index,
+            format_func=_language_label,
+            key="render_fallback_language",
+        )
+    with control_cols[1]:
+        translate_enabled = st.checkbox(
+            "Also generate a translated version", value=False, key="render_translate"
+        )
+    with control_cols[2]:
+        target_language = st.selectbox(
+            "Translation target",
+            codes,
+            index=0,
+            format_func=_language_label,
+            key="render_target_language",
+            disabled=not translate_enabled,
+        )
+    apply_uniqueness = st.checkbox(
+        "Apply anti-duplicate fingerprinting",
+        value=bool(config.get("anti_duplicate_enabled", True)),
+        key="render_uniqueness",
+        help="Subtle zoom, colour grade and 1.02x speed with resynced subtitles.",
     )
     layout_mode = st.session_state.get("layout_mode", "split")
     st.caption(
         "Layout: "
         + ("Split-Screen" if layout_mode == "split" else "Full-Screen blurred")
-        + " | RU: 1.04x zoom, colour grade, 1.02x speed, resynced subtitles"
+        + " | Native language first, translation optional"
     )
 
-    if st.button("Render Selected Clips (EN + RU)", type="primary", width="stretch"):
+    if st.button("Render Selected Clips", type="primary", width="stretch"):
         if not selected:
             st.warning("Select at least one clip to render.")
         else:
@@ -794,16 +998,26 @@ def tab_batch_render() -> None:
             for index, label in enumerate(selected):
                 clip_id = Path(label).stem
                 raw_path = RAW_DIR / label
+                source_language = (
+                    normalize_language(find_clip_language(clip_id)) or fallback_language
+                )
+                target = target_language if translate_enabled else None
+                if target and normalize_language(target) == source_language:
+                    target = None
                 with st.status(f"Processing {clip_id}", expanded=True) as status:
                     try:
                         result = run_clip_pipeline(
                             clip_id,
                             raw_path,
+                            source_lang=source_language,
+                            target_lang=target,
+                            game_name=str(config.get("default_game") or ""),
                             layout_mode=layout_mode,
                             preset_name=_preset_for_clip(clip_id),
                             cam_box=_cam_box_for_clip(clip_id),
                             config=_style_config(),
                             progress=status.write,
+                            apply_uniqueness=apply_uniqueness,
                         )
                         st.session_state.render_results[clip_id] = result
                         status.update(label=f"Rendered {clip_id}", state="complete")
@@ -819,7 +1033,7 @@ def tab_batch_render() -> None:
                 st.success(f"Batch complete: {completed} clip(s) rendered.")
 
     st.divider()
-    st.subheader("Side-by-Side Output Gallery")
+    st.subheader("Output Gallery")
     results = collect_render_results()
     if not results:
         st.info("Rendered outputs will appear here with editable publishing metadata.")
@@ -829,7 +1043,7 @@ def tab_batch_render() -> None:
 
 
 def tab_settings_channels() -> None:
-    st.header("Налаштування та API")
+    st.header("Settings & Channels")
     credentials_col, model_col = st.columns(2)
     with credentials_col:
         st.subheader("Credentials (.env)")
@@ -886,39 +1100,72 @@ def tab_settings_channels() -> None:
             _update_config_value("whisper_model", selected_model)
             st.success(f"Whisper model set to '{selected_model}'.")
 
+        st.subheader("Fingerprinting")
+        uniqueness_enabled = st.checkbox(
+            "Enable anti-duplicate fingerprinting",
+            value=bool(config.get("anti_duplicate_enabled", True)),
+            key="settings_uniqueness_enabled",
+        )
+        if st.button("Save Fingerprinting Toggle", width="stretch"):
+            _update_config_value("anti_duplicate_enabled", bool(uniqueness_enabled))
+            st.success("Fingerprinting setting saved to config.yaml.")
+
     st.divider()
     st.subheader("YouTube channels")
     uploader = YouTubeUploader()
-    statuses = uploader.token_status()
-    channel_columns = st.columns(2)
-    for column, channel in zip(channel_columns, ("en", "ru"), strict=False):
-        with column:
-            st.markdown(f"#### {channel.upper()} channel")
-            info = statuses[channel]
-            if info["exists"]:
-                if info["valid"]:
-                    st.success("OAuth token connected and valid.")
-                elif info["has_refresh_token"]:
-                    st.info("OAuth token present and refreshable.")
-                else:
-                    st.warning("OAuth token present but expired without a refresh token.")
-            else:
-                st.warning("No OAuth token connected.")
-            st.caption(f"Token file: {TOKEN_FILES[channel]}")
-            if st.button(f"Connect {channel.upper()} channel", key=f"connect_{channel}"):
-                if not CLIENT_SECRETS_FILE.exists():
-                    st.error(
-                        "Missing data/client_secret.json. Download an OAuth client from "
-                        "Google Cloud Console and save it there first."
-                    )
-                else:
-                    try:
-                        token_path = authorize_channel(channel)
-                        st.success(f"Connected. Token saved to {token_path}.")
-                    except Exception as exc:  # noqa: BLE001 - surface OAuth UI failures
-                        st.error(f"OAuth connection failed: {exc}")
+    codes = _supported_languages()
+    channel_cols = st.columns(2)
+    with channel_cols[0]:
+        channel_choice = st.selectbox(
+            "Channel language",
+            [*codes, CUSTOM_LANGUAGE],
+            format_func=lambda value: (
+                "Custom ISO code…" if value == CUSTOM_LANGUAGE else _language_label(value)
+            ),
+            key="settings_channel_language",
+        )
+        channel_language = normalize_language(channel_choice)
+        if channel_choice == CUSTOM_LANGUAGE:
+            channel_custom = st.text_input(
+                "Custom channel language code", value="en", key="settings_channel_custom"
+            )
+            channel_language = normalize_language(channel_custom)
+        if not channel_language:
+            st.warning("Enter a valid language code before connecting a channel.")
+            channel_language = codes[0]
 
-    quotas = uploader.check_quota_status()
+    statuses = uploader.token_status([channel_language])
+    info = statuses[channel_language]
+    with channel_cols[1]:
+        st.markdown(
+            f"#### {language_name(channel_language)} {language_badge(channel_language)}"
+        )
+        if info["exists"]:
+            if info["valid"]:
+                st.success("OAuth token connected and valid.")
+            elif info["has_refresh_token"]:
+                st.info("OAuth token present and refreshable.")
+            else:
+                st.warning("OAuth token present but expired without a refresh token.")
+        else:
+            st.warning("No OAuth token connected.")
+        st.caption(f"Token file: {get_token_path(channel_language)}")
+    if st.button(f"Connect {channel_language.upper()} channel", width="stretch"):
+        if not CLIENT_SECRETS_FILE.exists():
+            st.error(
+                "Missing data/client_secret.json. Download an OAuth client from "
+                "Google Cloud Console and save it there first."
+            )
+        else:
+            try:
+                token_path = authorize_channel(channel_language)
+                st.success(f"Connected. Token saved to {token_path}.")
+            except Exception as exc:  # noqa: BLE001 - surface OAuth UI failures
+                st.error(f"OAuth connection failed: {exc}")
+
+    connected = list_connected_languages()
+    channel_codes = sorted(set(connected + ([channel_language] if channel_language else [])))
+    quotas = uploader.check_quota_status(channel_codes)
     st.subheader("Scheduling controls")
     schedule_cols = st.columns(4)
     with schedule_cols[0]:
@@ -929,34 +1176,37 @@ def tab_settings_channels() -> None:
         st.number_input("Spacing (hours)", min_value=1, max_value=168, key="schedule_interval")
     with schedule_cols[3]:
         st.number_input("Slot index", min_value=0, max_value=4, key="schedule_slot")
+    summary = "; ".join(
+        f"{code.upper()} {quotas[code]['used_today']}/{quotas[code]['max_daily']}"
+        for code in channel_codes
+    )
     st.caption(
-        f"Hard guard: maximum 5 uploads per channel per UTC day. "
-        f"EN used today: {quotas['en']['used_today']}/{quotas['en']['max_daily']}; "
-        f"RU used today: {quotas['ru']['used_today']}/{quotas['ru']['max_daily']}."
+        "Hard guard: maximum 5 uploads per language channel per UTC day. "
+        + (summary or "No channels connected yet.")
     )
     st.dataframe(
         [
             {
-                "Channel": channel.upper(),
-                "Connected": quotas[channel]["connected"],
-                "Max/day": quotas[channel]["max_daily"],
-                "Used today": quotas[channel]["used_today"],
-                "Remaining": quotas[channel]["remaining"],
-                "OK": quotas[channel]["ok"],
+                "Channel": language_badge(code),
+                "Language": language_name(code),
+                "Connected": quotas[code]["connected"],
+                "Max/day": quotas[code]["max_daily"],
+                "Used today": quotas[code]["used_today"],
+                "Remaining": quotas[code]["remaining"],
+                "OK": quotas[code]["ok"],
             }
-            for channel in ("en", "ru")
+            for code in channel_codes
         ],
         width="stretch",
         hide_index=True,
     )
-    token_refresh = st.button("Refresh OAuth status", width="stretch")
-    if token_refresh:
+    if st.button("Refresh OAuth status", width="stretch"):
         st.rerun()
 
 
 def main() -> None:
     st.set_page_config(
-        page_title="GTA6 Clip Factory",
+        page_title="ClipForge Studio",
         layout="wide",
         initial_sidebar_state="expanded",
     )
@@ -965,10 +1215,10 @@ def main() -> None:
     render_sidebar_health()
     fetch_tab, crop_tab, render_tab, settings_tab = st.tabs(
         [
-            "Збір кліпів",
-            "Рамка вебкамери та стиль",
-            "Рендер та перевірка",
-            "Налаштування та API",
+            "Fetch & Queue",
+            "Crop & Style",
+            "Batch Render & Preview",
+            "Settings & Channels",
         ]
     )
     with fetch_tab:

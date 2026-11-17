@@ -1,4 +1,19 @@
-# Configuration for gta6-clip-factory
+# Configuration for the universal multi-game / multi-language clip studio
+
+# Defaults used by the UI and CLI wrappers
+default_game: "Grand Theft Auto VI"
+default_language: "en"
+supported_languages:
+  - en
+  - uk
+  - es
+  - de
+  - fr
+  - pl
+  - pt
+  - ru
+  - ja
+  - ko
 
 # Video dimensions (1080x1920 = 9:16)
 width: 1080
@@ -19,11 +34,12 @@ margin_v: 220  # vertical bottom margin
 margin_x: 100
 margin_y: 100
 
-# Uniqueness parameters for EN/RU versions
-en_scale: 1.0
-ru_scale: 1.04
-ru_contrast: 1.03
-ru_saturation: 1.05
+# Toggleable anti-duplicate fingerprinting
+anti_duplicate_enabled: true
+anti_duplicate_scale: 1.04
+anti_duplicate_contrast: 1.03
+anti_duplicate_saturation: 1.05
+anti_duplicate_speed: 1.02
 
 # Audio settings
 audio_sample_rate: 44100
