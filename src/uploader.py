@@ -1,233 +1,429 @@
+"""YouTube Data API v3 uploader with per-channel quota and scheduling guards.
+
+Two independent OAuth2 token files (EN and RU) are supported.  Uploads are
+spaced with ISO-8601 ``publishAt`` timestamps and a local upload ledger keeps a
+hard cap of five uploads per channel per UTC day.
+"""
+
+from __future__ import annotations
+
 import json
 import logging
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from google.oauth2 import exceptions as oauth_exceptions
+from google.auth.exceptions import GoogleAuthError, RefreshError
+from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from googleapiclient import errors as gapi_errors
+from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-SCOPES = ['https://www.googleapis.com/auth/youtube.upload']
-DATA_DIR = Path("data")
-TOKEN_EN_FILE = DATA_DIR / "token_en.json"
-TOKEN_RU_FILE = DATA_DIR / "token_ru.json"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = PROJECT_ROOT / "data"
+TOKEN_FILES = {
+    "en": DATA_DIR / "token_en.json",
+    "ru": DATA_DIR / "token_ru.json",
+}
+TOKEN_EN_FILE = TOKEN_FILES["en"]
+TOKEN_RU_FILE = TOKEN_FILES["ru"]
+CLIENT_SECRETS_FILE = DATA_DIR / "client_secret.json"
+UPLOAD_HISTORY_FILE = DATA_DIR / "upload_history.json"
+
+SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 QUOTA_MAX_DAILY_UPLOADS = 5
+MAX_TITLE_LENGTH = 100
+MAX_DESCRIPTION_LENGTH = 5000
+MIN_SCHEDULE_LEAD = timedelta(minutes=15)
+MAX_SCHEDULE_INTERVAL_HOURS = 168
+UPLOAD_RETRIES = 3
+
+
+def _ensure_dirs() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _read_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Could not read %s: %s", path, exc)
+        return default
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    _ensure_dirs()
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    temp_path.replace(path)
+
+
+def _load_history() -> dict[str, list[dict[str, Any]]]:
+    payload = _read_json(UPLOAD_HISTORY_FILE, {})
+    history: dict[str, list[dict[str, Any]]] = {}
+    if isinstance(payload, dict):
+        for channel, entries in payload.items():
+            if channel in TOKEN_FILES and isinstance(entries, list):
+                history[channel] = [entry for entry in entries if isinstance(entry, dict)]
+    for channel in TOKEN_FILES:
+        history.setdefault(channel, [])
+    return history
+
+
+def _save_history(history: dict[str, list[dict[str, Any]]]) -> None:
+    _write_json(UPLOAD_HISTORY_FILE, history)
+
+
+def _today_count(channel: str) -> int:
+    today = datetime.now(UTC).date()
+    count = 0
+    for entry in _load_history().get(channel, []):
+        raw_timestamp = entry.get("uploaded_at")
+        if not isinstance(raw_timestamp, str):
+            continue
+        try:
+            normalized = raw_timestamp[:-1] + "+00:00" if raw_timestamp.endswith("Z") else raw_timestamp
+            uploaded_at = datetime.fromisoformat(normalized)
+        except ValueError:
+            continue
+        if uploaded_at.tzinfo is None:
+            uploaded_at = uploaded_at.replace(tzinfo=UTC)
+        if uploaded_at.astimezone(UTC).date() == today:
+            count += 1
+    return count
+
+
+def _record_upload(channel: str, video_id: str, publish_at: datetime) -> None:
+    history = _load_history()
+    history.setdefault(channel, []).append(
+        {
+            "video_id": video_id,
+            "publish_at": publish_at.isoformat(),
+            "uploaded_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
+        }
+    )
+    _save_history(history)
+
 
 def get_credentials_from_token(token_file: Path) -> Credentials | None:
+    """Load OAuth2 credentials from a token JSON file."""
+    token_file = Path(token_file)
     if not token_file.exists():
         logger.error("Token file not found: %s", token_file)
         return None
     try:
-        creds = Credentials.from_authorized_user_info(json.loads(token_file.read_text()), scopes=SCOPES)
-        return creds
-    except (oauth_exceptions.OAuthError, ValueError, KeyError, json.JSONDecodeError) as e:
-        logger.error("Failed to load credentials from %s: %s", token_file, e)
+        return Credentials.from_authorized_user_file(str(token_file), SCOPES)
+    except (OSError, ValueError, KeyError, GoogleAuthError) as exc:
+        logger.error("Failed to load credentials from %s: %s", token_file, exc)
         return None
 
-def refresh_credentials_if_needed(creds: Credentials) -> Credentials:
-    if creds.expired and creds.refresh_token:
-        try:
-            creds.refresh(token=creds.refresh_token)
-            logger.info("Credentials refreshed")
-        except oauth_exceptions.OAuthError as e:
-            logger.error("Failed to refresh credentials: %s", e)
-            raise
+
+def refresh_credentials_if_needed(
+    creds: Credentials, token_file: Path | None = None
+) -> Credentials:
+    """Refresh expired credentials and persist the new token when possible."""
+    if not creds.expired:
+        return creds
+    if not creds.refresh_token:
+        raise RefreshError("Credentials are expired and have no refresh token.")
+    try:
+        creds.refresh(Request())
+    except (RefreshError, GoogleAuthError) as exc:
+        logger.error("Failed to refresh Google credentials: %s", exc)
+        raise
+    if token_file is not None and creds.valid:
+        Path(token_file).write_text(creds.to_json(), encoding="utf-8")
+        logger.info("Refreshed credentials saved to %s", token_file)
     return creds
 
+
 def get_youtube_service(token_file: Path) -> Any | None:
+    """Build an authorised YouTube Data API client or return None."""
     creds = get_credentials_from_token(token_file)
     if not creds:
         return None
-    creds = refresh_credentials_if_needed(creds)
     try:
-        service = build('youtube', 'v3', credentials=creds)
-        return service
-    except gapi_errors.HttpError as e:
-        logger.error("Failed to build YouTube service: %s", e)
+        creds = refresh_credentials_if_needed(creds, Path(token_file))
+        return build("youtube", "v3", credentials=creds, cache_discovery=False)
+    except (RefreshError, GoogleAuthError, HttpError, OSError) as exc:
+        logger.error("Failed to build YouTube service for %s: %s", token_file, exc)
         return None
 
-def check_daily_quota(service: Any, token_file: Path) -> bool:
-    today = datetime.now(UTC).date().isoformat()
-    # List recent uploads from the channel to count today's uploads (simplify: last 50 videos)
-    try:
-        channel_response = service.channels().list(
-            part='contentDetails',
-            mine=True
-        ).execute()
-        uploads_playlist_id = channel_response['items'][0]['contentDetails']['relatedPlaylists']['uploads']
-        playlist_items = service.playlistItems().list(
-            playlistId=uploads_playlist_id,
-            part='snippet',
-            maxResults=50
-        ).execute().get('items', [])
-        # Count videos uploaded today
-        count = 0
-        for item in playlist_items:
-            video_published_at = item['snippet']['publishedAt']
-            video_date = video_published_at.split('T')[0]
-            if video_date == today:
-                count += 1
-                if count >= QUOTA_MAX_DAILY_UPLOADS:
-                    logger.warning("Daily quota reached: %d uploads today", count)
-                    return False
-        return True
-    except (gapi_errors.HttpError, KeyError) as e:
-        logger.error("Failed to check daily quota: %s", e)
-        return True  # assume quota ok on error
+
+def get_token_status(token_file: Path) -> dict[str, Any]:
+    """Return connection information without performing a network call."""
+    token_file = Path(token_file)
+    status: dict[str, Any] = {
+        "token_file": str(token_file),
+        "exists": token_file.exists(),
+        "valid": False,
+        "expired": None,
+        "has_refresh_token": False,
+    }
+    if not token_file.exists():
+        return status
+    creds = get_credentials_from_token(token_file)
+    if creds is None:
+        return status
+    status.update(
+        {
+            "valid": bool(creds.valid),
+            "expired": bool(creds.expired),
+            "has_refresh_token": bool(creds.refresh_token),
+        }
+    )
+    return status
+
+
+def check_daily_quota(channel_or_token: str | Path) -> bool:
+    """Return True when another upload is allowed for this channel today."""
+    if isinstance(channel_or_token, Path):
+        channel = "en" if channel_or_token == TOKEN_EN_FILE else "ru"
+    else:
+        channel = "en" if str(channel_or_token).lower() == "en" else "ru"
+    return _today_count(channel) < QUOTA_MAX_DAILY_UPLOADS
+
+
+def authorize_channel(channel: str, client_secrets_file: Path | None = None) -> Path:
+    """Run the installed-app OAuth flow and save a token for one channel."""
+    key = channel.lower()
+    if key not in TOKEN_FILES:
+        raise ValueError("channel must be 'en' or 'ru'")
+    secrets_path = Path(client_secrets_file) if client_secrets_file else CLIENT_SECRETS_FILE
+    if not secrets_path.exists():
+        raise FileNotFoundError(
+            f"Google OAuth client secrets not found: {secrets_path}. "
+            "Download it from Google Cloud Console and save it as data/client_secret.json."
+        )
+    flow = InstalledAppFlow.from_client_secrets_file(str(secrets_path), SCOPES)
+    creds = flow.run_local_server(port=0, prompt="consent")
+    token_file = TOKEN_FILES[key]
+    _ensure_dirs()
+    token_file.write_text(creds.to_json(), encoding="utf-8")
+    logger.info("Saved %s channel token to %s", key.upper(), token_file)
+    return token_file
+
+
+def _validate_metadata(title: str, description: str, tags: list[str] | None) -> list[str]:
+    if not title.strip():
+        raise ValueError("YouTube title must not be empty.")
+    if len(title) > MAX_TITLE_LENGTH:
+        raise ValueError(f"YouTube title must be at most {MAX_TITLE_LENGTH} characters.")
+    if len(description) > MAX_DESCRIPTION_LENGTH:
+        raise ValueError(
+            f"YouTube description must be at most {MAX_DESCRIPTION_LENGTH} characters."
+        )
+    cleaned_tags = [str(tag).strip() for tag in (tags or []) if str(tag).strip()]
+    if sum(len(tag) for tag in cleaned_tags) > 450:
+        cleaned_tags = cleaned_tags[:15]
+    return cleaned_tags
+
 
 def schedule_video(
     token_file: Path,
     video_path: Path,
     title: str,
     description: str,
-    tags: list[str],
-    category: int = 22,  # People & Blogs
-    privacy: str = 'public',
-    start_time: datetime | None = None,
-    interval_hours: int = 24
+    tags: list[str] | None = None,
+    publish_at: datetime | None = None,
+    category: int = 22,
+    privacy: str = "public",
 ) -> str | None:
-    """Schedule a video upload.
-    If start_time is None, schedule at next interval from now.
-    """
+    """Upload a video with ``publishAt`` and return its YouTube video id."""
+    token_file = Path(token_file)
+    video_path = Path(video_path)
+    channel = "en" if token_file == TOKEN_EN_FILE else "ru"
+
+    if not video_path.exists() or video_path.stat().st_size == 0:
+        logger.error("Video file is missing or empty: %s", video_path)
+        return None
+    try:
+        cleaned_tags = _validate_metadata(title, description, tags)
+    except ValueError as exc:
+        logger.error("Invalid YouTube metadata: %s", exc)
+        return None
+    if _today_count(channel) >= QUOTA_MAX_DAILY_UPLOADS:
+        logger.error("Daily upload quota reached for %s channel.", channel.upper())
+        return None
+
     service = get_youtube_service(token_file)
     if not service:
-        logger.error("YouTube service unavailable for %s", token_file.name)
-        return None
-    # Check quota
-    if not check_daily_quota(service, token_file):
-        logger.error("Quota exceeded for %s", token_file.name)
         return None
 
-    # Determine publishAt
-    if start_time is None:
-        # Find next interval from now
-        now = datetime.now(UTC)
-        # Align to hour boundaries? Just use now + 1 hour as next slot
-        start_time = now + timedelta(hours=1)
-    publish_at = start_time.isoformat().replace('+00:00', 'Z')
+    now = datetime.now(UTC)
+    if publish_at is None:
+        publish_at = now + timedelta(hours=1)
+    if publish_at.tzinfo is None:
+        publish_at = publish_at.replace(tzinfo=UTC)
+    publish_at = publish_at.astimezone(UTC)
+    publish_at = max(publish_at, now + MIN_SCHEDULE_LEAD)
 
-    # Prepare request
-    request = service.videos().insert(
-        part='snippet,status',
-        body={
-            'snippet': {
-                'title': title,
-                'description': description,
-                'tags': tags,
-                'categoryId': str(category),
-                'defaultLanguage': 'en',
-                'defaultAudioLanguage': 'en',
-            },
-            'status': {
-                'privacyStatus': privacy,
-                'publishAt': publish_at,
-            }
+    body = {
+        "snippet": {
+            "title": title.strip(),
+            "description": description.strip(),
+            "tags": cleaned_tags,
+            "categoryId": str(category),
+            "defaultLanguage": "ru" if channel == "ru" else "en",
+            "defaultAudioLanguage": "ru" if channel == "ru" else "en",
         },
-        media_body=MediaFileUpload(str(video_path), chunksize=-1, resumable=True, mimetype='video/*')
+        "status": {
+            "privacyStatus": "private",
+            "publishAt": publish_at.isoformat().replace("+00:00", "Z"),
+            "selfDeclaredMadeForKids": False,
+            "license": "youtube",
+            "embeddable": True,
+        },
+    }
+    if privacy == "unlisted" and publish_at <= now + MIN_SCHEDULE_LEAD:
+        body["status"]["privacyStatus"] = "unlisted"
+
+    media = MediaFileUpload(
+        str(video_path),
+        chunksize=8 * 1024 * 1024,
+        resumable=True,
+        mimetype="video/*",
     )
-    try:
-        response = request.execute()
-        video_id = response['id']
-        logger.info("Scheduled video ID %s for %s", video_id, publish_at)
-        return video_id
-    except gapi_errors.HttpError as e:
-        logger.error("Failed to schedule video: %s", e)
+    request = service.videos().insert(
+        part="snippet,status",
+        body=body,
+        media_body=media,
+    )
+
+    video_id: str | None = None
+    for attempt in range(1, UPLOAD_RETRIES + 1):
+        try:
+            response = None
+            while response is None:
+                _status, response = request.next_chunk()
+            video_id = str(response.get("id") or "") or None
+            break
+        except HttpError as exc:
+            status_code = getattr(exc.resp, "status", 0)
+            logger.warning(
+                "YouTube upload attempt %d/%d failed with HTTP %s: %s",
+                attempt,
+                UPLOAD_RETRIES,
+                status_code,
+                exc,
+            )
+            retryable = status_code in {429, 500, 502, 503, 504}
+            if not retryable or attempt == UPLOAD_RETRIES:
+                return None
+            time.sleep(2**attempt)
+        except (RefreshError, GoogleAuthError, OSError) as exc:
+            logger.error("YouTube upload failed: %s", exc)
+            return None
+
+    if not video_id:
+        logger.error("YouTube upload finished without a video id.")
         return None
+    _record_upload(channel, video_id, publish_at)
+    logger.info(
+        "Scheduled %s video %s for %s", channel.upper(), video_id, publish_at.isoformat()
+    )
+    return video_id
+
 
 class YouTubeUploader:
-    def __init__(self):
-        self.quotas = {
-            "en": QUOTA_MAX_DAILY_UPLOADS,
-            "ru": QUOTA_MAX_DAILY_UPLOADS,
-        }
-        self.upload_counts = {"en": 0, "ru": 0}
-        self.load_counts_from_state()
+    """High-level per-language upload facade used by the Streamlit UI."""
 
-    def load_counts_from_state(self):
-        # Could load from a file, but for simplicity track in memory
-        # In production, you would persist daily counts.
-        pass
+    def __init__(self, max_daily: int = QUOTA_MAX_DAILY_UPLOADS) -> None:
+        self.max_daily = max_daily
 
-    def upload_and_schedule(
+    @property
+    def token_files(self) -> dict[str, Path]:
+        return dict(TOKEN_FILES)
+
+    def token_status(self) -> dict[str, dict[str, Any]]:
+        return {channel: get_token_status(path) for channel, path in TOKEN_FILES.items()}
+
+    def upload(
         self,
         video_path: Path,
-        hook_text: str,
         title: str,
         description: str,
         language: str = "en",
+        tags: list[str] | None = None,
         start_time: datetime | None = None,
-        interval_hours: int = 24
+        interval_hours: int = 24,
+        slot_index: int = 0,
     ) -> bool:
-        if language == "en":
-            token_file = TOKEN_EN_FILE
-        else:
-            token_file = TOKEN_RU_FILE
+        """Schedule one EN or RU video and respect the daily quota."""
+        key = "ru" if str(language).lower().startswith("ru") else "en"
+        token_file = TOKEN_FILES[key]
         if not token_file.exists():
-            logger.error("Token file not found: %s", token_file)
-            return False
-        # Generate a more detailed description with hook
-        full_description = f"{description}\n\nHook: {hook_text}"
-        tags = []
-        if language == "en":
-            tags = ["gaming", "GTA6", "shorts", "viral"]
-        else:
-            tags = ["gaming", "GTA6", "shorts", "russian", "вирусный"]
-        video_id = schedule_video(
-            token_file,
-            video_path,
-            title,
-            full_description,
-            tags,
-            start_time=start_time,
-            interval_hours=interval_hours
-        )
-        if video_id:
-            logger.info("Uploaded and scheduled %s video: %s", language, video_id)
-            return True
-        else:
-            logger.error("Failed to schedule %s video", language)
+            logger.error("No OAuth token connected for %s channel.", key.upper())
             return False
 
-    def check_quota_status(self) -> dict[str, Any]:
-        status = {}
-        for lang in ["en", "ru"]:
-            status[lang] = {
-                "max_daily": self.quotas[lang],
-                "used_today": self.upload_counts[lang],
-                "remaining": self.quotas[lang] - self.upload_counts[lang],
-                "ok": self.upload_counts[lang] < self.quotas[lang]
+        interval = max(1, min(int(interval_hours), MAX_SCHEDULE_INTERVAL_HOURS))
+        slot = max(0, int(slot_index))
+        if start_time is None:
+            publish_at = datetime.now(UTC) + timedelta(hours=1 + interval * slot)
+        else:
+            if start_time.tzinfo is None:
+                start_time = start_time.replace(tzinfo=UTC)
+            publish_at = start_time + timedelta(hours=interval * slot)
+
+        default_tags = (
+            ["gaming", "GTA6", "shorts", "russian", "вирусный"]
+            if key == "ru"
+            else ["gaming", "GTA6", "shorts", "viral"]
+        )
+        video_id = schedule_video(
+            token_file=token_file,
+            video_path=Path(video_path),
+            title=title,
+            description=description,
+            tags=tags or default_tags,
+            publish_at=publish_at,
+            privacy="public",
+        )
+        return bool(video_id)
+
+    def check_quota_status(self) -> dict[str, dict[str, Any]]:
+        """Return per-channel quota usage for the Settings tab."""
+        status: dict[str, dict[str, Any]] = {}
+        history = _load_history()
+        for channel, token_file in TOKEN_FILES.items():
+            used = _today_count(channel)
+            status[channel] = {
+                "token_file": str(token_file),
+                "connected": token_file.exists(),
+                "max_daily": self.max_daily,
+                "used_today": used,
+                "remaining": max(0, self.max_daily - used),
+                "ok": used < self.max_daily,
+                "recent": history.get(channel, [])[-5:],
             }
         return status
 
-if __name__ == "__main__":
-    # Simple CLI test: schedule a video if token file exists
-    import sys
-    if len(sys.argv) < 2:
-        logger.info("Usage: python src/uploader.py <video_path>")
-        sys.exit(1)
-    video_path = Path(sys.argv[1])
-    if not video_path.exists():
-        logger.error("Video file not found: %s", video_path)
-        sys.exit(1)
-    # Use existing token file if present
-    token_file = TOKEN_EN_FILE if TOKEN_EN_FILE.exists() else TOKEN_RU_FILE
-    if not token_file.exists():
-        logger.error("No token file found")
-        sys.exit(1)
-    video_id = schedule_video(
-        token_file,
+
+def upload_clip(
+    video_path: Path,
+    title: str,
+    description: str,
+    language: str = "en",
+    start_time: datetime | None = None,
+    interval_hours: int = 24,
+    slot_index: int = 0,
+) -> bool:
+    """Convenience wrapper used by the UI."""
+    return YouTubeUploader().upload(
         video_path,
-        "Test Upload via CLI",
-        "Test upload from GTA6 Clip Factory uploader module.",
-        ["test", "upload"]
+        title,
+        description,
+        language=language,
+        start_time=start_time,
+        interval_hours=interval_hours,
+        slot_index=slot_index,
     )
-    if video_id:
-        logger.info("Test upload scheduled with ID: %s", video_id)
-    else:
-        logger.error("Test upload failed.")
