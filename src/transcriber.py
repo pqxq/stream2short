@@ -1,257 +1,506 @@
+"""Speech transcription, subtitle generation and EN -> RU localisation.
+
+The module is deliberately import-safe: expensive Whisper models are loaded
+lazily, and every network/LLM failure degrades gracefully to offline
+translation templates so a batch render never crashes.
+"""
+
+from __future__ import annotations
+
 import json
 import logging
 import os
+import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
 import openai
-import torch
 import yaml
 from deep_translator import GoogleTranslator
 from faster_whisper import WhisperModel
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-CONFIG_PATH = Path("config.yaml")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+CONFIG_PATH = PROJECT_ROOT / "config.yaml"
+WORKSPACE_TEMP_DIR = PROJECT_ROOT / "workspace" / "temp"
+DATA_DIR = PROJECT_ROOT / "data"
 
-with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-    config = yaml.safe_load(f)
+DEFAULT_CONFIG: dict[str, Any] = {
+    "width": 1080,
+    "height": 1920,
+    "whisper_model": "small",
+    "compute_type": "int8",
+    "font_family": "DejaVu Sans",
+    "font_size": 36,
+    "primary_color": "#FFFF00",
+    "outline_thickness": 2,
+    "margin_v": 220,
+}
+MAX_LINE_CHARS = 32
+MAX_HOOK_CHARS = 45
+WHISPER_SAMPLE_RATE = 16000
 
-WIDTH = config["width"]
-HEIGHT = config["height"]
-WHISPER_MODEL_NAME = config["whisper_model"]
-COMPUTE_TYPE = config["compute_type"]
-FONT_FAMILY = config["font_family"]
-FONT_SIZE = config["font_size"]
-PRIMARY_COLOR = config["primary_color"]
-OUTLINE_THICKNESS = config["outline_thickness"]
-MARGIN_V = config["margin_v"]
 
-MAX_LINE_LENGTH = 32
-
-DATA_DIR = Path("data")
-WORKSPACE_TEMP_DIR = Path("workspace/temp")
-
-def load_config() -> dict:
+def load_config() -> dict[str, Any]:
+    """Load config.yaml merged over safe defaults."""
+    config = dict(DEFAULT_CONFIG)
+    if CONFIG_PATH.exists():
+        try:
+            with CONFIG_PATH.open("r", encoding="utf-8") as handle:
+                loaded = yaml.safe_load(handle) or {}
+            if isinstance(loaded, dict):
+                config.update(loaded)
+        except (OSError, yaml.YAMLError) as exc:
+            logger.warning("Could not read %s: %s", CONFIG_PATH, exc)
     return config
 
-def ensure_dirs():
+
+def ensure_dirs() -> None:
     WORKSPACE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def _run_ffmpeg(command: list[str]) -> None:
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError("ffmpeg is not installed or not on PATH.") from exc
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip().splitlines()
+        detail = stderr[-1] if stderr else "unknown ffmpeg error"
+        raise RuntimeError(f"ffmpeg failed: {detail}") from exc
+
+
 class WhisperTranscriber:
-    def __init__(self, model_name: str = WHISPER_MODEL_NAME, compute_type: str = COMPUTE_TYPE):
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model = WhisperModel(model_name, device=device, compute_type=compute_type)
-        logger.info("Whisper model loaded on %s", device)
+    """Lazy faster-whisper wrapper that only needs CPU by default."""
+
+    def __init__(
+        self,
+        model_name: str = DEFAULT_CONFIG["whisper_model"],
+        compute_type: str = DEFAULT_CONFIG["compute_type"],
+        device: str = "cpu",
+    ) -> None:
+        self.model_name = model_name
+        self.compute_type = compute_type
+        self.device = device
+        self._model: WhisperModel | None = None
+
+    @property
+    def model(self) -> WhisperModel:
+        if self._model is None:
+            try:
+                self._model = WhisperModel(
+                    self.model_name,
+                    device=self.device,
+                    compute_type=self.compute_type,
+                )
+            except (RuntimeError, ValueError) as exc:
+                logger.warning("Whisper int8 load failed (%s); retrying with float32.", exc)
+                self._model = WhisperModel(
+                    self.model_name,
+                    device="cpu",
+                    compute_type="float32",
+                )
+            logger.info("Whisper model '%s' loaded on %s", self.model_name, self.device)
+        return self._model
+
+    def extract_audio(self, video_path: Path) -> Path:
+        """Extract a mono 16 kHz WAV suitable for faster-whisper."""
+        video_path = Path(video_path)
+        if not video_path.exists():
+            raise FileNotFoundError(f"Media file not found: {video_path}")
+        ensure_dirs()
+        audio_path = WORKSPACE_TEMP_DIR / f"{video_path.stem}_audio.wav"
+        _run_ffmpeg(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(video_path),
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                str(WHISPER_SAMPLE_RATE),
+                "-c:a",
+                "pcm_s16le",
+                str(audio_path),
+            ]
+        )
+        return audio_path
 
     def transcribe(self, audio_path: Path) -> list[dict[str, Any]]:
-        """Transcribe audio file using faster-whisper.
-        Returns list of segments with start, end, text.
-        """
+        """Return non-empty segments as start/end/text dictionaries."""
+        audio_path = Path(audio_path)
         if not audio_path.exists():
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        segments, _info = self.model.transcribe(
+            str(audio_path),
+            language="en",
+            beam_size=5,
+            vad_filter=True,
+            condition_on_previous_text=False,
+            word_timestamps=False,
+        )
+        result: list[dict[str, Any]] = []
+        for segment in segments:
+            text = (segment.text or "").strip()
+            if not text:
+                continue
+            result.append(
+                {
+                    "start": round(float(segment.start), 3),
+                    "end": round(float(segment.end), 3),
+                    "text": text,
+                }
+            )
+        logger.info("Transcribed %d segments from %s", len(result), audio_path.name)
+        return result
 
-        try:
-            segments, _ = self.model.transcribe(str(audio_path), language="en", word_timestamps=False)
-            result = []
-            for segment in segments:
-                result.append({
-                    "start": segment.start,
-                    "end": segment.end,
-                    "text": segment.text.strip(),
-                })
-            logger.info("Transcribed %d segments from %s", len(result), audio_path.name)
-            return result
-        except Exception as e:
-            logger.error("Whisper transcription failed: %s", e)
-            raise
 
 class ASSGenerator:
-    def __init__(self, config: dict):
-        self.width = config["width"]
-        self.height = config["height"]
-        self.font_family = config["font_family"]
-        self.font_size = config["font_size"]
-        self.primary_color = config["primary_color"]
-        self.outline_thickness = config["outline_thickness"]
-        self.margin_v = config["margin_v"]
+    """Render segments into a mobile-safe 1080x1920 ASS subtitle file."""
 
-    def wrap_text(self, text: str) -> list[str]:
-        """Wrap text to max 32 characters, break at word boundaries using \\N."""
-        if len(text) <= MAX_LINE_LENGTH:
-            return [text]
-        words = text.split()
-        lines = []
-        current_line = ""
-        for word in words:
-            if not current_line:
-                candidate = word
-            else:
-                candidate = f"{current_line} {word}"
-            if len(candidate) <= MAX_LINE_LENGTH:
-                current_line = candidate
-            else:
-                if current_line:
-                    lines.append(current_line)
-                    current_line = word
-                else:
-                    lines.append(word)
-        if current_line:
-            lines.append(current_line)
-        return lines
-
-    def segments_to_ass(self, segments: list[dict[str, Any]]) -> str:
-        """Generate ASS subtitle content from segments."""
-        lines = []
-        lines.append("[Script Info]")
-        lines.append("Title: GTA6 Clip Factory")
-        lines.append("ScriptType: v4.00+")
-        lines.append(f"PlayResX: {self.width}")
-        lines.append(f"PlayResY: {self.height}")
-        lines.append("\n[Fonts]")
-        lines.append(f"FontName: {self.font_family}")
-        lines.append("\n[Events]")
-        lines.append("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text")
-
-        for idx, seg in enumerate(segments, start=1):
-            start_time = self._format_time(seg["start"])
-            end_time = self._format_time(seg["end"])
-            text = seg["text"]
-            wrapped = self.wrap_text(text)
-            for line in wrapped:
-                escaped_line = line.replace("\\", "\\\\").replace("{", "{{").replace("}", "}}")
-                lines.append(f"Dialogue: 0,{start_time},{end_time},Default,,0,0,{self.margin_v},,{{{escaped_line}}}")
-        return "\n".join(lines)
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
+        self.config = config or load_config()
+        self.width = int(self.config["width"])
+        self.height = int(self.config["height"])
+        self.font_family = str(self.config["font_family"])
+        self.font_size = int(self.config["font_size"])
+        self.primary_color = self.hex_to_ass_bgr(str(self.config["primary_color"]))
+        self.outline_thickness = int(self.config["outline_thickness"])
+        self.margin_v = int(self.config["margin_v"])
+        self.max_line_chars = MAX_LINE_CHARS
 
     @staticmethod
-    def _format_time(seconds: float) -> str:
-        h = int(seconds // 3600)
-        m = int((seconds % 3600) // 60)
-        s = seconds % 60
-        cs = int((s - int(s)) * 100)
-        s = int(s)
-        return f"{h:01d}:{m:02d}:{s:02d}.{cs:02d}"
+    def hex_to_ass_bgr(hex_color: str) -> str:
+        value = hex_color.strip().lstrip("#")
+        if len(value) != 6:
+            value = "FFFF00"
+        try:
+            red = int(value[0:2], 16)
+            green = int(value[2:4], 16)
+            blue = int(value[4:6], 16)
+        except ValueError:
+            red, green, blue = 255, 255, 0
+        return f"&H00{blue:02X}{green:02X}{red:02X}&"
+
+    def wrap(self, text: str) -> list[str]:
+        """Wrap at word boundaries, force-splitting words longer than the limit."""
+        normalized = re.sub(r"\s+", " ", text).strip()
+        if not normalized:
+            return []
+        words: list[str] = []
+        for word in normalized.split(" "):
+            while len(word) > self.max_line_chars:
+                words.append(word[: self.max_line_chars])
+                word = word[self.max_line_chars :]
+            words.append(word)
+        lines: list[str] = []
+        current = ""
+        for word in words:
+            candidate = f"{current} {word}".strip()
+            if len(candidate) <= self.max_line_chars:
+                current = candidate
+            else:
+                if current:
+                    lines.append(current)
+                current = word
+        if current:
+            lines.append(current)
+        return lines
+
+    @staticmethod
+    def _escape(text: str) -> str:
+        return text.replace("\\", "\\\\").replace("{", r"\{").replace("}", r"\}")
+
+    @staticmethod
+    def format_timestamp(seconds: float) -> str:
+        safe = max(0.0, float(seconds))
+        hours = int(safe // 3600)
+        minutes = int((safe % 3600) // 60)
+        whole_seconds = int(safe % 60)
+        centiseconds = round((safe - int(safe)) * 100)
+        if centiseconds >= 100:
+            centiseconds = 99
+        return f"{hours}:{minutes:02d}:{whole_seconds:02d}.{centiseconds:02d}"
+
+    def build(self, segments: list[dict[str, Any]], lang: str = "en") -> str:
+        """Build a complete ASS document including styles and events."""
+        lines = [
+            "[Script Info]",
+            "Title: GTA6 Clip Factory",
+            "ScriptType: v4.00+",
+            "WrapStyle: 0",
+            "ScaledBorderAndShadow: yes",
+            f"PlayResX: {self.width}",
+            f"PlayResY: {self.height}",
+            "",
+            "[V4+ Styles]",
+            (
+                "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+                "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, "
+                "ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
+                "MarginL, MarginR, MarginV, Encoding"
+            ),
+            (
+                f"Style: Default,{self.font_family},{self.font_size},{self.primary_color},"
+                f"{self.primary_color},&H00000000&,&H00000000&,1,0,0,0,100,100,0,0,1,"
+                f"{self.outline_thickness},0,2,100,100,{self.margin_v},1"
+            ),
+            "",
+            "[Events]",
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+        ]
+        for segment in segments:
+            text = str(segment.get("text") or "").strip()
+            wrapped = self.wrap(text)
+            if not wrapped:
+                continue
+            start = self.format_timestamp(float(segment.get("start") or 0.0))
+            end = self.format_timestamp(float(segment.get("end") or 0.0))
+            dialogue_text = r"\N".join(self._escape(line) for line in wrapped)
+            lines.append(f"Dialogue: 0,{start},{end},Default,,0,0,{self.margin_v},,{dialogue_text}")
+        lines.append("")
+        return "\n".join(lines)
+
+    def write(self, segments: list[dict[str, Any]], path: Path, lang: str = "en") -> Path:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(self.build(segments, lang=lang), encoding="utf-8")
+        return path
+
+
+def _trim_hook(text: str, fallback_en: str, fallback_ru: str, lang: str) -> str:
+    value = re.sub(r"\s+", " ", text).strip().strip("\"'")
+    if not value:
+        return fallback_en if lang == "en" else fallback_ru
+    if len(value) > MAX_HOOK_CHARS:
+        value = value[: MAX_HOOK_CHARS - 3].rstrip(" ,.!?-") + "..."
+    return value
+
 
 class TranslationHookGenerator:
-    def __init__(self, llm_config: dict):
-        self.llm_url = llm_config.get("LLM_BASE_URL")
-        self.llm_key = llm_config.get("LLM_API_KEY")
-        self.llm_model = llm_config.get("LLM_MODEL")
-        self.use_llm = bool(self.llm_url and self.llm_key)
-        if self.use_llm:
+    """LLM-first translation with deep-translator/template fallbacks."""
+
+    def __init__(
+        self,
+        llm_url: str | None = None,
+        llm_key: str | None = None,
+        llm_model: str | None = None,
+    ) -> None:
+        self.llm_url = llm_url or os.getenv("LLM_BASE_URL")
+        self.llm_key = llm_key or os.getenv("LLM_API_KEY")
+        self.llm_model = llm_model or os.getenv("LLM_MODEL")
+        self.source = "template"
+        self.client: openai.OpenAI | None = None
+        if self.llm_key and self.llm_url:
             self.client = openai.OpenAI(api_key=self.llm_key, base_url=self.llm_url)
-        logger.info("LLM configured: %s", "yes" if self.use_llm else "fallback to deep-translator")
+        logger.info(
+            "Translation backend: %s",
+            "LLM" if self.client else "deep-translator/template fallback",
+        )
+
+    def _template_hooks(self, english_text: str, russian_text: str) -> tuple[str, str]:
+        english_words = english_text.split()
+        russian_words = russian_text.split()
+        en_phrase = " ".join(english_words[:4]) if english_words else "this GTA VI moment"
+        ru_phrase = " ".join(russian_words[:4]) if russian_words else "этот момент из GTA VI"
+        en_hook = _trim_hook(f"Wait for it... {en_phrase}!", "GTA VI MOMENT!", "", "en")
+        ru_hook = _trim_hook(f"Ты не поверишь: {ru_phrase}!", "", "МОМЕНТ ИЗ GTA VI!", "ru")
+        return en_hook, ru_hook
+
+    @staticmethod
+    def _parse_json_payload(content: str) -> dict[str, Any]:
+        cleaned = content.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+        try:
+            parsed = json.loads(cleaned)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _llm_translate(
+        self, texts: list[str], full_text: str
+    ) -> tuple[list[str] | None, str | None, str | None]:
+        if not self.client:
+            return None, None, None
+        prompt = (
+            "Translate each English gaming-clip subtitle into natural, idiomatic Russian. "
+            "Keep the same array length and order. Then write one punchy English hook and "
+            "one punchy Russian hook, each at most 45 characters. Return strict JSON with "
+            'keys "translations" (array of strings), "en_hook" and "ru_hook".\n'
+            f"Subtitles: {json.dumps(texts, ensure_ascii=False)}\n"
+            f"Full transcript: {full_text}"
+        )
+        try:
+            response = self.client.chat.completions.create(
+                model=self.llm_model or "gpt-3.5-turbo",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a professional gaming localisation editor.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.4,
+                max_tokens=2048,
+            )
+            content = response.choices[0].message.content or ""
+            payload = self._parse_json_payload(content)
+            translations = payload.get("translations")
+            if not isinstance(translations, list) or len(translations) != len(texts):
+                return None, None, None
+            ru_values = [str(item).strip() for item in translations]
+            en_hook = payload.get("en_hook")
+            ru_hook = payload.get("ru_hook")
+            return (
+                ru_values,
+                str(en_hook) if en_hook else None,
+                str(ru_hook) if ru_hook else None,
+            )
+        except (
+            openai.APIError,
+            openai.APIConnectionError,
+            openai.RateLimitError,
+            ValueError,
+            KeyError,
+            IndexError,
+        ) as exc:
+            logger.warning("LLM translation failed (%s); using offline fallback.", exc)
+            return None, None, None
+
+    def _deep_translate(self, texts: list[str]) -> list[str] | None:
+        if not texts:
+            return []
+        try:
+            translator = GoogleTranslator(source="auto", target="ru")
+            translated = translator.translate_batch(texts)
+            if isinstance(translated, list) and len(translated) == len(texts):
+                return [str(item or "").strip() for item in translated]
+        except (RuntimeError, ValueError, OSError, AttributeError) as exc:
+            logger.warning("deep-translator failed (%s); keeping source text.", exc)
+        return None
 
     def translate_and_hooks(self, text: str) -> dict[str, Any]:
-        """Translate text to Russian and generate viral hook headlines for EN and RU."""
-        translation = None
-        en_hook = None
-        ru_hook = None
-
-        if self.use_llm:
-            try:
-                sys_prompt = (
-                    "You are a video subtitle translator and viral hook generator for gaming clips. "
-                    "Translate the following English subtitle into idiomatic Russian suitable for gamers. "
-                    "Also generate two viral hook headlines: one in English (~45 chars) and one in Russian (~45 chars). "
-                    "Return JSON with fields: translation (Russian), en_hook, ru_hook."
-                )
-                resp = self.client.chat.completions.create(
-                    model=self.llm_model,
-                    messages=[
-                        {"role": "system", "content": sys_prompt},
-                        {"role": "user", "content": text}
-                    ],
-                    response_format={"type": "json_object"},
-                    temperature=0.7,
-                    max_tokens=150,
-                )
-                out = resp.choices[0].message.content
-                data = json.loads(out)
-                translation = data.get("translation")
-                en_hook = data.get("en_hook")
-                ru_hook = data.get("ru_hook")
-                logger.info("LLM translation and hooks generated.")
-            except Exception as e:
-                logger.warning("LLM translation failed (%s), falling back to deep-translator.", e)
-                self.use_llm = False
-
-        if not self.use_llm:
-            try:
-                translator = GoogleTranslator(source="auto", target="ru")
-                translation = translator.translate(text)
-                logger.info("Deep-translator translation: %s", translation[:50])
-            except Exception as e:
-                logger.error("Deep-translator also failed: %s", e)
-                translation = "[Translation unavailable]"
-
-        if not en_hook:
-            en_hook = self._generate_simple_hook(text, lang="en")
-        if not ru_hook and translation and translation != "[Translation unavailable]":
-            ru_hook = self._generate_simple_hook(translation, lang="ru")
-
-        return {
-            "translation": translation,
-            "en_hook": en_hook,
-            "ru_hook": ru_hook,
-        }
-
-    def _generate_simple_hook(self, text: str, lang: str) -> str:
-        """Simple template-based hook if LLM unavailable."""
-        words = text.split()
-        if len(words) > 4:
-            key_phrase = " ".join(words[:4])
+        """Translate plain text and produce EN/RU hooks. Never raises."""
+        english = re.sub(r"\s+", " ", text).strip()
+        translations, en_hook, ru_hook = self._llm_translate([english] if english else [], english)
+        if translations is not None:
+            self.source = "llm"
+            russian = translations[0] if translations else ""
         else:
-            key_phrase = text
-        templates = {
-            "en": f"Can't believe this {key_phrase}!!!",
-            "ru": f"Представляете, {key_phrase}? Это фаново!",
+            fallback = self._deep_translate([english] if english else [])
+            if fallback is not None:
+                self.source = "deeptranslator"
+                russian = fallback[0] if fallback else ""
+            else:
+                self.source = "template"
+                russian = english
+        template_en, template_ru = self._template_hooks(english, russian)
+        return {
+            "translation": russian,
+            "en_hook": _trim_hook(en_hook or "", template_en, template_ru, "en"),
+            "ru_hook": _trim_hook(ru_hook or "", template_en, template_ru, "ru"),
+            "source": self.source,
         }
-        return templates.get(lang, key_phrase)
+
+    def translate_segments(self, segments: list[dict[str, Any]]) -> dict[str, Any]:
+        """Translate all segments while preserving indexes and timings."""
+        texts = [str(segment.get("text") or "").strip() for segment in segments]
+        full_text = " ".join(text for text in texts if text).strip()
+        if not texts:
+            template_en, template_ru = self._template_hooks("", "")
+            return {
+                "translations": [],
+                "en_hook": template_en,
+                "ru_hook": template_ru,
+                "source": "template",
+            }
+        translations, en_hook, ru_hook = self._llm_translate(texts, full_text)
+        if translations is not None:
+            self.source = "llm"
+        else:
+            translations = self._deep_translate(texts)
+            if translations is not None:
+                self.source = "deeptranslator"
+            else:
+                self.source = "template"
+                translations = texts
+        russian_text = " ".join(item for item in translations if item).strip()
+        template_en, template_ru = self._template_hooks(full_text, russian_text)
+        return {
+            "translations": translations,
+            "en_hook": _trim_hook(en_hook or "", template_en, template_ru, "en"),
+            "ru_hook": _trim_hook(ru_hook or "", template_en, template_ru, "ru"),
+            "source": self.source,
+        }
+
 
 class SubtitleProcessor:
-    def __init__(self, config: dict):
-        self.config = config
-        self.whisper = WhisperTranscriber()
-        self.ass_gen = ASSGenerator(config)
-        self.translator_hooks = TranslationHookGenerator({
-            "LLM_BASE_URL": os.getenv("LLM_BASE_URL"),
-            "LLM_API_KEY": os.getenv("LLM_API_KEY"),
-            "LLM_MODEL": os.getenv("LLM_MODEL"),
-        })
+    """End-to-end speech -> EN/RU ASS and hooks."""
 
-    def process(self, audio_path: Path) -> dict[str, Any]:
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
+        self.config = config or load_config()
+        self.ass_generator = ASSGenerator(self.config)
+        self.translator = TranslationHookGenerator()
+        self._whisper: WhisperTranscriber | None = None
+
+    @property
+    def whisper(self) -> WhisperTranscriber:
+        if self._whisper is None:
+            self._whisper = WhisperTranscriber(
+                model_name=str(self.config.get("whisper_model", "small")),
+                compute_type=str(self.config.get("compute_type", "int8")),
+            )
+        return self._whisper
+
+    def process(self, media_path: Path, clip_id: str) -> dict[str, Any]:
         ensure_dirs()
-        # Transcribe
-        segments = self.whisper.transcribe(audio_path)
-        # Generate ASS content
-        ass_content = self.ass_gen.segments_to_ass(segments)
-        # Save ASS to workspace/temp/<clip_id>.ass
-        ass_file = WORKSPACE_TEMP_DIR / f"{audio_path.stem}.ass"
-        with open(ass_file, "w", encoding="utf-8") as f:
-            f.write(ass_content)
-        # Generate translation and hooks from entire transcribed text
-        full_text = " ".join(seg["text"] for seg in segments)
-        translation_data = self.translator_hooks.translate_and_hooks(full_text)
-        # Save translation_data JSON for later use
-        data_file = WORKSPACE_TEMP_DIR / f"{audio_path.stem}_translation.json"
-        with open(data_file, "w", encoding="utf-8") as f:
-            json.dump(translation_data, f, indent=2)
-        logger.info("Subtitle processing complete: %s", audio_path.name)
-        return {
-            "segments": segments,
-            "ass_path": str(ass_file),
-            "translation": translation_data,
-        }
+        media_path = Path(media_path)
+        if not media_path.exists():
+            raise FileNotFoundError(f"Media file not found: {media_path}")
+        clip_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", clip_id).strip("._") or media_path.stem
 
-if __name__ == "__main__":
-    # Quick test: process a dummy audio file if exists
-    import sys
-    if len(sys.argv) > 1:
-        audio = Path(sys.argv[1])
-        processor = SubtitleProcessor(load_config())
-        processor.process(audio)
-    else:
-        logger.info("Usage: python src/transcriber.py <audio_path>")
+        audio_path = self.whisper.extract_audio(media_path)
+        segments = self.whisper.transcribe(audio_path)
+
+        translation = self.translator.translate_segments(segments)
+        ru_segments = [
+            {**segment, "text": translated}
+            for segment, translated in zip(segments, translation["translations"], strict=False)
+        ]
+
+        ass_en = WORKSPACE_TEMP_DIR / f"{clip_id}_en.ass"
+        ass_ru = WORKSPACE_TEMP_DIR / f"{clip_id}_ru.ass"
+        self.ass_generator.write(segments, ass_en, lang="en")
+        self.ass_generator.write(ru_segments, ass_ru, lang="ru")
+
+        payload = {
+            "clip_id": clip_id,
+            "media_path": str(media_path),
+            "audio_path": str(audio_path),
+            "segments_en": segments,
+            "segments_ru": ru_segments,
+            "ass_path_en": str(ass_en),
+            "ass_path_ru": str(ass_ru),
+            "translation": translation.get("translation", ""),
+            "en_hook": translation["en_hook"],
+            "ru_hook": translation["ru_hook"],
+            "hook_source": translation["source"],
+        }
+        translation_file = WORKSPACE_TEMP_DIR / f"{clip_id}_translation.json"
+        translation_file.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        logger.info("Subtitle processing complete for %s (%d segments)", clip_id, len(segments))
+        return payload
+
+
+def process_media(media_path: Path, clip_id: str) -> dict[str, Any]:
+    """Convenience wrapper used by the UI and smoke tests."""
+    return SubtitleProcessor().process(media_path, clip_id)
