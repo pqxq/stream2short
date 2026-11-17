@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -459,22 +460,33 @@ class SubtitleProcessor:
             )
         return self._whisper
 
-    def process(self, media_path: Path, clip_id: str) -> dict[str, Any]:
+    def process(
+        self,
+        media_path: Path,
+        clip_id: str,
+        progress: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
         ensure_dirs()
         media_path = Path(media_path)
         if not media_path.exists():
             raise FileNotFoundError(f"Media file not found: {media_path}")
         clip_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", clip_id).strip("._") or media_path.stem
 
+        if progress:
+            progress("Transcribing audio with faster-whisper...")
         audio_path = self.whisper.extract_audio(media_path)
         segments = self.whisper.transcribe(audio_path)
 
+        if progress:
+            progress("Translating segments and generating viral hooks...")
         translation = self.translator.translate_segments(segments)
         ru_segments = [
             {**segment, "text": translated}
             for segment, translated in zip(segments, translation["translations"], strict=False)
         ]
 
+        if progress:
+            progress("Building EN and RU subtitle files...")
         ass_en = WORKSPACE_TEMP_DIR / f"{clip_id}_en.ass"
         ass_ru = WORKSPACE_TEMP_DIR / f"{clip_id}_ru.ass"
         self.ass_generator.write(segments, ass_en, lang="en")
@@ -488,7 +500,9 @@ class SubtitleProcessor:
             "segments_ru": ru_segments,
             "ass_path_en": str(ass_en),
             "ass_path_ru": str(ass_ru),
-            "translation": translation.get("translation", ""),
+            "translation": " ".join(
+                item for item in translation.get("translations", []) if item
+            ),
             "en_hook": translation["en_hook"],
             "ru_hook": translation["ru_hook"],
             "hook_source": translation["source"],
