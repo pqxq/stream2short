@@ -20,7 +20,8 @@ import yt_dlp
 
 logger = logging.getLogger(__name__)
 
-DATA_DIR = Path("data")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = PROJECT_ROOT / "data"
 PROCESSED_CLIPS_FILE = DATA_DIR / "processed_clips.json"
 
 TWITCH_API_BASE = "https://api.twitch.tv/helix"

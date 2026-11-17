@@ -43,7 +43,15 @@ All runtime directories are created programmatically on startup: `data/`, `works
 After any code change, run:
 
 ```bash
-python3 -m py_compile app.py src/*.py
+python3 -m py_compile app.py src/*.py tests/smoke_test.py
+ruff check .
 ```
 
-Ensure zero syntax errors. Use the synthetic test clip flow to verify EN/RU outputs.
+Automated end-to-end smoke test (synthetic 5s clip, no API keys required):
+
+```bash
+.venv/bin/python tests/smoke_test.py --model small --keep
+```
+
+It verifies both `output/en/synth_test_en.mp4` and `output/ru/synth_test_ru.mp4`
+are playable 1080x1920 H.264/AAC files with distinct durations and fingerprints.

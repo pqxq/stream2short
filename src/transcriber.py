@@ -364,14 +364,7 @@ class TranslationHookGenerator:
                 str(en_hook) if en_hook else None,
                 str(ru_hook) if ru_hook else None,
             )
-        except (
-            openai.APIError,
-            openai.APIConnectionError,
-            openai.RateLimitError,
-            ValueError,
-            KeyError,
-            IndexError,
-        ) as exc:
+        except Exception as exc:  # noqa: BLE001 - every LLM/SDK failure must fall back
             logger.warning("LLM translation failed (%s); using offline fallback.", exc)
             return None, None, None
 
@@ -383,7 +376,7 @@ class TranslationHookGenerator:
             translated = translator.translate_batch(texts)
             if isinstance(translated, list) and len(translated) == len(texts):
                 return [str(item or "").strip() for item in translated]
-        except (RuntimeError, ValueError, OSError, AttributeError) as exc:
+        except Exception as exc:  # noqa: BLE001 - offline fallback must never crash
             logger.warning("deep-translator failed (%s); keeping source text.", exc)
         return None
 

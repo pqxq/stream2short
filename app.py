@@ -387,7 +387,7 @@ def render_sidebar_health() -> None:
     st.sidebar.metric("Processed clips", len(load_processed_clips()))
     st.sidebar.divider()
     st.sidebar.subheader("Zero-key verification")
-    if st.sidebar.button("Generate Synthetic Test Clip", use_container_width=True):
+    if st.sidebar.button("Generate Synthetic Test Clip", width="stretch"):
         if not HAS_FFMPEG:
             st.sidebar.error("Install ffmpeg first.")
         else:
@@ -411,7 +411,7 @@ def tab_fetch_and_queue() -> None:
             height=140,
             key="manual_urls",
         )
-        if st.button("Add URLs to Queue", use_container_width=True):
+        if st.button("Add URLs to Queue", width="stretch"):
             added = 0
             queue = list(st.session_state.clip_queue)
             known = {str(clip.get("id")) for clip in queue}
@@ -447,7 +447,7 @@ def tab_fetch_and_queue() -> None:
         game_name = st.text_input("Game name", value="Grand Theft Auto VI", key="game_name")
         timeframe = st.selectbox("Timeframe", ["24h", "7d", "30d"], index=1, key="timeframe")
         limit = st.number_input("Clip limit", min_value=1, max_value=20, value=10, key="clip_limit")
-        if st.button("Fetch Top Clips", use_container_width=True):
+        if st.button("Fetch Top Clips", width="stretch"):
             if not (os.getenv("TWITCH_CLIENT_ID") and os.getenv("TWITCH_CLIENT_SECRET")):
                 st.warning("Set TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET in Settings first.")
             else:
@@ -486,7 +486,7 @@ def tab_fetch_and_queue() -> None:
             with cols[0]:
                 thumbnail = str(clip.get("thumbnail") or "")
                 if thumbnail.startswith(("http://", "https://")):
-                    st.image(thumbnail, use_container_width=True)
+                    st.image(thumbnail, width="stretch")
                 else:
                     st.caption("No thumbnail")
             with cols[1]:
@@ -507,7 +507,7 @@ def tab_fetch_and_queue() -> None:
                 force = st.checkbox("Force re-download", key=f"force_{clip_id}")
             selections.append((clip, selected and (force or clip_id not in processed_ids)))
 
-    if st.button("Download Selected to Workspace", type="primary", use_container_width=True):
+    if st.button("Download Selected to Workspace", type="primary", width="stretch"):
         targets = [clip for clip, selected in selections if selected]
         if not targets:
             st.warning("Select at least one clip that is not already downloaded.")
@@ -615,13 +615,13 @@ def tab_crop_style_studio() -> None:
             st.image(
                 source_image,
                 caption="Source: green = webcam crop, blue = gameplay",
-                use_container_width=True,
+                width="stretch",
             )
         with right:
             st.image(
                 composite_image,
                 caption="Resulting 9:16 composite (sample hook + subtitle)",
-                use_container_width=True,
+                width="stretch",
             )
     except (RuntimeError, FileNotFoundError, OSError) as exc:
         st.error(f"Preview failed: {exc}")
@@ -633,7 +633,7 @@ def tab_crop_style_studio() -> None:
             "Save this crop for streamer", value=streamer or "default", key="preset_streamer"
         )
     with save_cols[1]:
-        if st.button("Save Preset for Streamer", use_container_width=True):
+        if st.button("Save Preset for Streamer", width="stretch"):
             save_preset(preset_streamer, cam_x, cam_y, cam_w, cam_h)
             st.success(f"Preset '{preset_streamer}' saved to presets.json.")
 
@@ -785,7 +785,7 @@ def tab_batch_render() -> None:
         + " | RU: 1.04x zoom, colour grade, 1.02x speed, resynced subtitles"
     )
 
-    if st.button("Render Selected Clips (EN + RU)", type="primary", use_container_width=True):
+    if st.button("Render Selected Clips (EN + RU)", type="primary", width="stretch"):
         if not selected:
             st.warning("Select at least one clip to render.")
         else:
@@ -856,7 +856,7 @@ def tab_settings_channels() -> None:
         llm_model = st.text_input(
             "LLM_MODEL", value=os.getenv("LLM_MODEL", "llama-3.1-8b-instant"), key="env_llm_model"
         )
-        if st.button("Save .env", use_container_width=True):
+        if st.button("Save .env", width="stretch"):
             _save_env_values(
                 {
                     "TWITCH_CLIENT_ID": twitch_id,
@@ -882,7 +882,7 @@ def tab_settings_channels() -> None:
             key="settings_whisper_model",
         )
         st.caption("int8 compute type is used for CPU-first execution.")
-        if st.button("Save Whisper Model", use_container_width=True):
+        if st.button("Save Whisper Model", width="stretch"):
             _update_config_value("whisper_model", selected_model)
             st.success(f"Whisper model set to '{selected_model}'.")
 
@@ -946,10 +946,10 @@ def tab_settings_channels() -> None:
             }
             for channel in ("en", "ru")
         ],
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
-    token_refresh = st.button("Refresh OAuth status", use_container_width=True)
+    token_refresh = st.button("Refresh OAuth status", width="stretch")
     if token_refresh:
         st.rerun()
 
