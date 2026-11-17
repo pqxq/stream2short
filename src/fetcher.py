@@ -242,31 +242,73 @@ class ClipFetcher:
             return payload if isinstance(payload, dict) else None
         return None
 
-    def _find_game_id(self, game_name: str) -> str | None:
-        payload = self._twitch_get("/games", {"name": game_name})
-        if payload is None:
-            logger.error("Twitch game lookup failed for %s", game_name)
+    @staticmethod
+    def _pick_game_entry(entries: Any, query: str) -> dict[str, str] | None:
+        if not isinstance(entries, list):
             return None
-        games = [game for game in payload.get("data", []) if isinstance(game, dict)]
+        games = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            game_id = str(entry.get("id") or "").strip()
+            if not game_id:
+                continue
+            games.append(
+                {"id": game_id, "name": str(entry.get("name") or "").strip()}
+            )
         if not games:
-            logger.warning("Twitch game not found: %s", game_name)
             return None
         exact = next(
             (
                 game
                 for game in games
-                if str(game.get("name") or "").strip().casefold() == game_name.strip().casefold()
+                if game["name"].casefold() == query.strip().casefold()
             ),
             None,
         )
-        selected = exact or games[0]
-        if len(games) > 1 and exact is None:
-            logger.info(
-                "Multiple Twitch games matched %s; using %s",
-                game_name,
-                selected.get("name"),
-            )
-        return str(selected.get("id") or "") or None
+        return exact or games[0]
+
+    @staticmethod
+    def _game_search_terms(game_name: str) -> list[str]:
+        terms = [game_name]
+        match = re.match(r"^(?P<base>.+?)\s+\d+(?:\.\d+)*$", game_name)
+        if match:
+            base = match.group("base").strip()
+            if base and base.casefold() != game_name.casefold():
+                terms.append(base)
+        return terms
+
+    def _find_game(self, game_name: str) -> dict[str, str] | None:
+        """Resolve a game name to its official Twitch id and canonical name."""
+        query = str(game_name or "").strip()
+        if not query:
+            return None
+
+        payload = self._twitch_get("/games", {"name": query})
+        if payload is not None:
+            selected = self._pick_game_entry(payload.get("data"), query)
+            if selected:
+                return selected
+
+        for term in self._game_search_terms(query):
+            payload = self._twitch_get("/search/categories", {"query": term})
+            if payload is None:
+                continue
+            selected = self._pick_game_entry(payload.get("data"), term)
+            if selected:
+                logger.info(
+                    "Resolved Twitch game %s to %s via category search",
+                    query,
+                    selected["name"] or selected["id"],
+                )
+                return selected
+
+        logger.warning("Twitch game not found: %s", query)
+        return None
+
+    def _find_game_id(self, game_name: str) -> str | None:
+        game = self._find_game(game_name)
+        return game["id"] if game else None
 
     def fetch_top_clips(
         self,
@@ -279,9 +321,11 @@ class ClipFetcher:
         resolved_game = (game_name or get_default_game()).strip() or get_default_game()
         if not self._headers():
             return []
-        game_id = self._find_game_id(resolved_game)
-        if not game_id:
+        game = self._find_game(resolved_game)
+        if not game:
             return []
+        game_id = game["id"]
+        canonical_game = game["name"] or resolved_game
 
         safe_first = max(1, min(int(first), 100))
         safe_period = _normalize_period(period)
@@ -311,7 +355,7 @@ class ClipFetcher:
             for clip in clips:
                 if not isinstance(clip, dict) or not clip.get("id"):
                     continue
-                normalized = _normalize_twitch_clip(clip, resolved_game)
+                normalized = _normalize_twitch_clip(clip, canonical_game)
                 if target_language is not None and normalized["language"] != target_language:
                     continue
                 collected.append(normalized)
@@ -329,7 +373,7 @@ class ClipFetcher:
             logger.debug(
                 "Fetched page %d for %s; %d matching clips so far",
                 page + 1,
-                resolved_game,
+                canonical_game,
                 len(collected),
             )
 
@@ -345,7 +389,7 @@ class ClipFetcher:
         logger.info(
             "Fetched %d Twitch clips for %s (language=%s)",
             len(result),
-            resolved_game,
+            canonical_game,
             target_language or "all",
         )
         return result

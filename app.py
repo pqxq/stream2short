@@ -57,7 +57,7 @@ ALL_LANGUAGES = "__all__"
 CUSTOM_LANGUAGE = "__custom__"
 GAME_PRESETS = [
     "Grand Theft Auto VI",
-    "Counter-Strike 2",
+    "Counter-Strike",
     "Valorant",
     "Dota 2",
     "Minecraft",
@@ -976,9 +976,11 @@ def tab_batch_render() -> None:
             key="render_target_language",
             disabled=not translate_enabled,
         )
+    st.session_state.setdefault(
+        "render_uniqueness", bool(config.get("anti_duplicate_enabled", True))
+    )
     apply_uniqueness = st.checkbox(
         "Apply anti-duplicate fingerprinting",
-        value=bool(config.get("anti_duplicate_enabled", True)),
         key="render_uniqueness",
         help="Subtle zoom, colour grade and 1.02x speed with resynced subtitles.",
     )
