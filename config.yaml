@@ -1,0 +1,29 @@
+# Configuration for gta6-clip-factory
+
+# Video dimensions (1080x1920 = 9:16)
+width: 1080
+height: 1920
+
+# Whisper model configuration
+whisper_model: "small"
+compute_type: "int8"
+
+# Subtitle styling
+font_family: "DejaVu Sans"
+font_size: 36
+primary_color: "#FFFF00"
+outline_thickness: 2
+margin_v: 220  # vertical bottom margin
+
+# Layout & margins
+margin_x: 100
+margin_y: 100
+
+# Uniqueness parameters for EN/RU versions
+en_scale: 1.0
+ru_scale: 1.04
+ru_contrast: 1.03
+ru_saturation: 1.05
+
+# Audio settings
+audio_sample_rate: 44100

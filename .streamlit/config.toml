@@ -1,0 +1,3 @@
+[server]
+server.maxUploadSize = 500
+base = "dark"

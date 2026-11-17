@@ -1,0 +1,20 @@
+{
+  "default": {
+    "cam_x": 0.0,
+    "cam_y": 0.0,
+    "cam_w": 0.2,
+    "cam_h": 0.25
+  },
+  "poggers": {
+    "cam_x": 0.6,
+    "cam_y": 0.1,
+    "cam_w": 0.35,
+    "cam_h": 0.35
+  },
+  "twitch": {
+    "cam_x": 0.0,
+    "cam_y": 0.6,
+    "cam_w": 0.45,
+    "cam_h": 0.3
+  }
+}
