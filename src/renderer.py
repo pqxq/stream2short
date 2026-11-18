@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -18,6 +19,13 @@ from typing import Any
 import yaml
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
+from src.fonts import (
+    CJK_FONT_CANDIDATES,
+    CJK_FONT_FAMILIES,
+    font_family_for as _platform_font_family,
+    resolve_font_path as _platform_resolve_font_path,
+)
+from src.ffmpeg_bin import ffmpeg_exe, ffprobe_exe
 from src.languages import normalize_language, validate_language_code
 
 logger = logging.getLogger(__name__)
@@ -30,16 +38,6 @@ WORKSPACE_RAW = PROJECT_ROOT / "workspace" / "raw"
 OUTPUT_ROOT = PROJECT_ROOT / "output"
 
 DEFAULT_PRESET = {"cam_x": 0.0, "cam_y": 0.0, "cam_w": 0.2, "cam_h": 0.25}
-FONT_CANDIDATES = (
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-)
-CJK_FONT_CANDIDATES = (
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-)
-CJK_FONT_FAMILIES = {"ja": "Noto Sans CJK JP", "ko": "Noto Sans CJK KR"}
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "width": 1080,
@@ -117,22 +115,18 @@ def save_preset(
 
 
 def font_family_for(lang_code: str | None) -> str:
+    """Cross-platform font family for the language (delegates to src.fonts)."""
     code = normalize_language(lang_code)
-    if code in CJK_FONT_FAMILIES and any(Path(path).exists() for path in CJK_FONT_CANDIDATES):
+    if code in CJK_FONT_FAMILIES and any(
+        Path(path).exists() for path in CJK_FONT_CANDIDATES
+    ):
         return CJK_FONT_FAMILIES[code]
-    return "DejaVu Sans"
+    return _platform_font_family(code)
 
 
-def resolve_font_path(lang_code: str | None = None) -> str:
-    code = normalize_language(lang_code)
-    if code in CJK_FONT_FAMILIES:
-        for candidate in CJK_FONT_CANDIDATES:
-            if Path(candidate).exists():
-                return candidate
-    for candidate in FONT_CANDIDATES:
-        if Path(candidate).exists():
-            return candidate
-    return FONT_CANDIDATES[0]
+def resolve_font_path(lang_code: str | None = None) -> str | None:
+    """First existing font file for the language (delegates to src.fonts)."""
+    return _platform_resolve_font_path(normalize_language(lang_code))
 
 
 def output_dir_for(lang_code: str) -> Path:
@@ -146,9 +140,22 @@ def _even(value: float, upper: int | None = None) -> int:
     return max(2, rounded)
 
 
-def _filter_path(path: Path) -> str:
-    text = str(Path(path).resolve())
-    return text.replace("\\", "\\\\").replace(":", "\\:").replace("'", r"\'")
+def _ffmpeg_filter_path(path: Path) -> str:
+    """Return an FFmpeg-filter-safe single-quoted path.
+
+    Uses a PROJECT_ROOT-relative path with forward slashes so Windows drive
+    colons stay out of the filtergraph; falls back to the absolute path when
+    the target is on a different drive.  Single quotes are escaped for the
+    filter parser and the result is already wrapped in single quotes.
+    """
+    target = Path(path).resolve()
+    try:
+        text = os.path.relpath(target, start=PROJECT_ROOT)
+    except ValueError:
+        text = str(target)
+    text = text.replace("\\", "/")
+    text = text.replace("'", "\\'")
+    return f"'{text}'"
 
 
 def _hex_to_ass_bgr(hex_color: str) -> str:
@@ -252,43 +259,103 @@ class FFmpegRenderer:
             directory.mkdir(parents=True, exist_ok=True)
 
     def probe(self, video_path: Path) -> dict[str, Any]:
-        """Return width/height/duration/audio information via ffprobe."""
-        command = [
-            "ffprobe",
-            "-v",
-            "error",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-            str(video_path),
-        ]
-        try:
-            completed = subprocess.run(command, check=True, capture_output=True, text=True)
-        except FileNotFoundError as exc:
-            raise RuntimeError("ffprobe is not installed or not on PATH.") from exc
-        except subprocess.CalledProcessError as exc:
-            raise RuntimeError(f"ffprobe failed: {(exc.stderr or '').strip()}") from exc
-        payload = json.loads(completed.stdout or "{}")
-        streams = payload.get("streams", [])
-        video_stream = next(
-            (stream for stream in streams if stream.get("codec_type") == "video"), {}
-        )
-        has_audio = any(stream.get("codec_type") == "audio" for stream in streams)
-        duration = 0.0
-        for candidate in (payload.get("format", {}).get("duration"), video_stream.get("duration")):
+        """Return width/height/duration/audio info via ffprobe or ffmpeg stderr."""
+        ffprobe = ffprobe_exe()
+        if ffprobe:
+            command = [
+                ffprobe,
+                "-v",
+                "error",
+                "-print_format",
+                "json",
+                "-show_format",
+                "-show_streams",
+                str(video_path),
+            ]
             try:
-                duration = float(candidate)
-            except (TypeError, ValueError):
-                continue
-            if duration > 0:
-                break
+                completed = subprocess.run(
+                    command,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    cwd=str(PROJECT_ROOT),
+                    encoding="utf-8",
+                    errors="replace",
+                )
+            except FileNotFoundError as exc:
+                raise RuntimeError("ffprobe is not installed or not on PATH.") from exc
+            except subprocess.CalledProcessError as exc:
+                raise RuntimeError(f"ffprobe failed: {(exc.stderr or '').strip()}") from exc
+            payload = json.loads(completed.stdout or "{}")
+            streams = payload.get("streams", [])
+            video_stream = next(
+                (stream for stream in streams if stream.get("codec_type") == "video"), {}
+            )
+            has_audio = any(stream.get("codec_type") == "audio" for stream in streams)
+            duration = 0.0
+            for candidate in (
+                payload.get("format", {}).get("duration"),
+                video_stream.get("duration"),
+            ):
+                try:
+                    duration = float(candidate)
+                except (TypeError, ValueError):
+                    continue
+                if duration > 0:
+                    break
+            return {
+                "width": int(video_stream.get("width") or 0),
+                "height": int(video_stream.get("height") or 0),
+                "duration": duration,
+                "has_audio": has_audio,
+                "video_streams": sum(1 for s in streams if s.get("codec_type") == "video"),
+            }
+
+        ffmpeg = ffmpeg_exe()
+        if not ffmpeg:
+            raise RuntimeError("Neither ffprobe nor ffmpeg could be found on this system.")
+        return self._probe_with_ffmpeg(ffmpeg, video_path)
+
+    def _probe_with_ffmpeg(self, ffmpeg: str, video_path: Path) -> dict[str, Any]:
+        """Parse ``ffmpeg -i`` stderr when ffprobe is unavailable (imageio-ffmpeg)."""
+        command = [ffmpeg, "-hide_banner", "-i", str(video_path)]
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=str(PROJECT_ROOT),
+                encoding="utf-8",
+                errors="replace",
+            )
+        except OSError as exc:
+            raise RuntimeError(f"ffmpeg probe failed to launch: {exc}") from exc
+        stderr = completed.stderr or ""
+        width = height = 0
+        size_match = re.search(r"(\d{2,5})x(\d{2,5})", stderr)
+        if size_match:
+            width, height = int(size_match.group(1)), int(size_match.group(2))
+        duration = 0.0
+        duration_match = re.search(r"Duration:\s*(\d+):(\d{2}):(\d{2})\.(\d{2,3})", stderr)
+        if duration_match:
+            hours, minutes, seconds, fraction = duration_match.groups()
+            divisor = 100.0 if len(fraction) == 2 else 1000.0
+            duration = (
+                int(hours) * 3600 + int(minutes) * 60 + int(seconds) + int(fraction) / divisor
+            )
+        has_audio = "Audio:" in stderr
+        video_streams = len(re.findall(r"Stream #\d+:\d+.*Video:", stderr))
+        if not width or not height:
+            raise RuntimeError(
+                f"Could not determine video dimensions for {video_path} with ffmpeg."
+            )
         return {
-            "width": int(video_stream.get("width") or 0),
-            "height": int(video_stream.get("height") or 0),
+            "width": width,
+            "height": height,
             "duration": duration,
             "has_audio": has_audio,
-            "video_streams": sum(1 for s in streams if s.get("codec_type") == "video"),
+            "video_streams": max(1, video_streams),
         }
 
     def _source_crop(self, probe: dict[str, Any]) -> tuple[int, int, int, int]:
@@ -318,11 +385,14 @@ class FFmpegRenderer:
             Path(path).exists() for path in CJK_FONT_CANDIDATES
         ):
             return CJK_FONT_FAMILIES[code]
+        resolved = resolve_font_path(code)
+        if resolved:
+            return _platform_font_family(code)
         return self.font_family
 
     def _subtitle_filter(self, ass_path: Path, font_family: str) -> str:
         return (
-            f"subtitles='{_filter_path(ass_path)}':"
+            f"subtitles={_ffmpeg_filter_path(ass_path)}:"
             f"force_style='{self._ass_force_style(font_family)}'"
         )
 
@@ -336,14 +406,21 @@ class FFmpegRenderer:
     def build_drawtext_filter(
         self,
         hook_file: Path,
-        font_path: Path,
+        font_path: Path | str | None,
+        font_family: str | None = None,
         x_expr: str = "(w-text_w)/2",
         y_expr: str = "120",
     ) -> str:
         hook_size = self.font_size + 10
+        font_part = ""
+        resolved = str(font_path) if font_path and Path(font_path).exists() else None
+        if resolved:
+            font_part = f"fontfile={_ffmpeg_filter_path(Path(resolved))}:"
+        elif font_family:
+            font_part = f"font={font_family}:"
         return (
-            f"drawtext=textfile='{_filter_path(hook_file)}':"
-            f"fontfile='{_filter_path(font_path)}':"
+            f"drawtext=textfile={_ffmpeg_filter_path(hook_file)}:"
+            f"{font_part}"
             f"fontsize={hook_size}:fontcolor=white:borderw=3:bordercolor=black:"
             f"x={x_expr}:y={y_expr}:fix_bounds=true:expansion=none"
         )
@@ -362,7 +439,7 @@ class FFmpegRenderer:
         game_height = self.height - CAM_PANEL_HEIGHT
         hook_file = self.write_hook_textfile(hook_text, f"{clip_id}_{lang_code}")
         font_family = self._font_family_for(lang_code)
-        font_path = Path(resolve_font_path(lang_code))
+        font_path = resolve_font_path(lang_code)
 
         if layout == "blur":
             graph = (
@@ -404,7 +481,7 @@ class FFmpegRenderer:
             final_ass = Path(ass_path)
 
         graph += (
-            f";[graded]{self.build_drawtext_filter(hook_file, font_path)}[hooked];"
+            f";[graded]{self.build_drawtext_filter(hook_file, font_path, font_family)}[hooked];"
             f"[hooked]{self._subtitle_filter(final_ass, font_family)}[vout]"
         )
         logger.debug("Filtergraph for %s/%s: %s", clip_id, lang_code, graph)
@@ -444,8 +521,11 @@ class FFmpegRenderer:
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / f"{clip_id}_{code}.mp4"
 
+        ffmpeg = ffmpeg_exe()
+        if not ffmpeg:
+            raise RuntimeError("ffmpeg is not installed or not on PATH.")
         command = [
-            "ffmpeg",
+            ffmpeg,
             "-y",
             "-i",
             str(raw_video_path),
@@ -479,7 +559,15 @@ class FFmpegRenderer:
         command.append(str(output_path))
 
         try:
-            subprocess.run(command, check=True, capture_output=True, text=True)
+            subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+                cwd=str(PROJECT_ROOT),
+                encoding="utf-8",
+                errors="replace",
+            )
         except FileNotFoundError as exc:
             raise RuntimeError("ffmpeg is not installed or not on PATH.") from exc
         except subprocess.CalledProcessError as exc:
@@ -561,8 +649,11 @@ class FFmpegRenderer:
         self.ensure_dirs()
         duration = self.probe(video_path).get("duration") or 0.0
         frame_path = WORKSPACE_TEMP / f"{video_path.stem}_preview_frame.png"
+        ffmpeg = ffmpeg_exe()
+        if not ffmpeg:
+            raise RuntimeError("ffmpeg is not installed or not on PATH.")
         command = [
-            "ffmpeg",
+            ffmpeg,
             "-y",
             "-ss",
             f"{max(0.0, duration / 2.0):.3f}",
@@ -573,14 +664,30 @@ class FFmpegRenderer:
             str(frame_path),
         ]
         try:
-            subprocess.run(command, check=True, capture_output=True, text=True)
+            subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+                cwd=str(PROJECT_ROOT),
+                encoding="utf-8",
+                errors="replace",
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("ffmpeg is not installed or not on PATH.") from exc
         except subprocess.CalledProcessError as exc:
             raise RuntimeError(f"Frame extraction failed: {(exc.stderr or '').strip()}") from exc
         return frame_path
 
     def _load_font(self, size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+        font_path = resolve_font_path()
+        if font_path:
+            try:
+                return ImageFont.truetype(font_path, size=size)
+            except OSError:
+                pass
         try:
-            return ImageFont.truetype(resolve_font_path(), size=size)
+            return ImageFont.truetype(_platform_font_family(), size=size)
         except OSError:
             return ImageFont.load_default()
 

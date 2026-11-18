@@ -22,6 +22,8 @@ import yaml
 from deep_translator import GoogleTranslator
 from faster_whisper import WhisperModel
 
+from src.fonts import CJK_FONT_CANDIDATES, CJK_FONT_FAMILIES
+from src.ffmpeg_bin import ffmpeg_exe
 from src.languages import (
     DEFAULT_SUPPORTED_LANGUAGES,
     language_name,
@@ -54,10 +56,6 @@ MAX_LINE_CHARS = 32
 MAX_HOOK_CHARS = 45
 MAX_TITLE_CHARS = 100
 WHISPER_SAMPLE_RATE = 16000
-CJK_FONT_PATHS = (
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
-)
 
 NATIVE_TEMPLATES: dict[str, dict[str, str]] = {
     "en": {

@@ -1,4 +1,4 @@
-"""ShortStack - open-source multi-game, multi-language clip studio.
+"""Stream2Short - open-source multi-game, multi-language clip studio.
 
 Run with ``streamlit run app.py``. Importing this module has no Streamlit side
 effects, so the synthetic smoke test can reuse the pipeline helpers directly.
@@ -457,7 +457,7 @@ def _cached_previews(
 
 
 def render_sidebar_health() -> None:
-    st.sidebar.title("ShortStack")
+    st.sidebar.title("Stream2Short")
     st.sidebar.caption("Open-source vertical clip studio")
     st.sidebar.subheader("System health")
     if HAS_FFMPEG:
@@ -1411,7 +1411,7 @@ def tab_settings_channels() -> None:
 
 def main() -> None:
     st.set_page_config(
-        page_title="ShortStack",
+        page_title="Stream2Short",
         layout="wide",
         initial_sidebar_state="expanded",
     )

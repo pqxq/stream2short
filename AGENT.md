@@ -1,7 +1,7 @@
-# AGENT.md - ShortStack
+# AGENT.md - Stream2Short
 
 ## 1. Project Overview
-ShortStack is an open-source, dark-mode **Streamlit** studio for Linux (Ubuntu/Debian) that turns gaming clips from any Twitch/YouTube source into vertical `9:16` (`1080x1920`) Shorts/TikToks for **any supported language niche**.
+Stream2Short is an open-source, dark-mode **Streamlit** studio for Linux (Ubuntu/Debian) that turns gaming clips from any Twitch/YouTube source into vertical `9:16` (`1080x1920`) Shorts/TikToks for **any supported language niche**.
 
 The pipeline is language-first and game-agnostic:
 1. Resolve a game dynamically via Twitch Helix `/helix/games` and fetch clips with client-side language filtering.
@@ -28,7 +28,7 @@ No game, language pair, or channel count is hardcoded. Defaults come from `confi
 ## 3. Repository & Runtime Directory Structure
 
 ```text
-shortstack/
+stream2short/
 ├── AGENT.md               # Project rules & architecture guide for AI coding agents
 ├── .streamlit/
 │   └── config.toml        # Dark theme configuration & server.maxUploadSize
@@ -133,7 +133,7 @@ When enabled for a render:
 ## 6. GUI Architecture (`app.py`)
 
 ### Global & Sidebar Requirements
-- `st.set_page_config(page_title="ShortStack", layout="wide")`.
+- `st.set_page_config(page_title="Stream2Short", layout="wide")`.
 - Persist clip queues, selection states, crop coordinates and render metadata in `st.session_state`.
 - **Sidebar:** FFmpeg check, Whisper status, processed-clip count, active pipeline language, and **"Generate Synthetic Test Clip"** which runs the full native pipeline for the currently selected language with zero API keys.
 
