@@ -5,7 +5,7 @@ Contributions are welcome across clip discovery, subtitle styling, FFmpeg filter
 ## Local Development
 
 ```bash
-git clone [https://github.com/pqxq/stream2short.git](https://github.com/pqxq/stream2short.git)
+git clone https://github.com/pqxq/stream2short.git
 cd stream2short
 ./start.sh
 ```
