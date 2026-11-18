@@ -9,6 +9,10 @@ Stream2Short is a local-first Streamlit studio that turns gaming clips into 9:16
 
 ![Stream2Short preview](docs/preview.png)
 
+## Studio Showcase
+
+![Stream2Short Studio Showcase](docs/screenshots/02-crop-studio.png)
+
 ## Capabilities
 
 - **Multi-language Twitch discovery.** Resolves any Twitch game by name, paginates clip results, and filters by ISO 639-1 language directly on the client.
@@ -93,25 +97,23 @@ start.bat
    streamlit run app.py
    ```
 
-## Studio Walkthrough
+## Interface Walkthrough
 
-The interface is divided into four functional tabs:
+The studio interface is organized into four tabs:
 
 ### 1. Fetch & Queue
 
-Select target language and game, then fetch clips via Twitch Helix or paste public URLs directly.
+Select target language and game, then fetch clips via Twitch Helix or paste public URLs directly into the queue.
 
 ![Fetch and Queue](docs/screenshots/01-fetch-queue.png)
 
 ### 2. Crop & Style
 
-Adjust webcam crop coordinates, toggle between split-screen and blurred background layouts, and configure subtitle typography.
-
-![Crop and Style Studio](docs/screenshots/02-crop-studio.png)
+Calibrate webcam coordinates, toggle split-screen and blurred layouts, adjust subtitle typography, and save per-streamer crop presets.
 
 ### 3. Batch Render & Preview
 
-Render queued clips in their native language (or with translated variants), inspect localized titles/descriptions/CTAs, and schedule uploads.
+Render queued clips in their native language or generate translated variants. Review side-by-side vertical video players and localized publishing metadata.
 
 ![Batch Render and Preview](docs/screenshots/03-batch-render.png)
 

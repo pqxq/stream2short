@@ -127,7 +127,7 @@ def _init_state() -> None:
     preset_options = _game_preset_options()
     default_game = str(config.get("default_game") or preset_options[0]).strip()
     defaults: dict[str, Any] = {
-        "clip_queue": [],
+        "clip_queue": list(load_processed_clips()),
         "render_results": {},
         "layout_mode": "split",
         "font_size_control": config["font_size"],
@@ -140,6 +140,7 @@ def _init_state() -> None:
         "schedule_time": time(18, 0),
         "game_name_control": default_game,
         "game_preset_control": default_game if default_game in preset_options else preset_options[0],
+        "fetch_language_choice": normalize_language(config.get("default_language")) or "en",
         "pipeline_language": normalize_language(config.get("default_language")) or "en",
         "render_uniqueness": bool(config.get("anti_duplicate_enabled", True)),
     }
@@ -160,21 +161,23 @@ def clip_id_from_url(url: str) -> str:
 
 
 def find_streamer(clip_id: str) -> str:
+    clean_id = clip_id.strip("_")
     for clip in st.session_state.get("clip_queue", []):
-        if str(clip.get("id")) == clip_id:
+        if str(clip.get("id")).strip("_") == clean_id:
             return str(clip.get("streamer") or "")
     for clip in load_processed_clips():
-        if str(clip.get("id")) == clip_id:
+        if str(clip.get("id")).strip("_") == clean_id:
             return str(clip.get("streamer") or "")
     return ""
 
 
 def find_clip_language(clip_id: str) -> str:
+    clean_id = clip_id.strip("_")
     for clip in st.session_state.get("clip_queue", []):
-        if str(clip.get("id")) == clip_id:
+        if str(clip.get("id")).strip("_") == clean_id:
             return normalize_language(clip.get("language")) or ""
     for clip in load_processed_clips():
-        if str(clip.get("id")) == clip_id:
+        if str(clip.get("id")).strip("_") == clean_id:
             return normalize_language(clip.get("language")) or ""
     return ""
 
