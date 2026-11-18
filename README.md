@@ -9,10 +9,6 @@ Stream2Short is a local-first Streamlit studio that turns gaming clips into 9:16
 
 ![Stream2Short preview](docs/preview.png)
 
-## Studio Showcase
-
-![Stream2Short Studio Showcase](docs/screenshots/02-crop-studio.png)
-
 ## Capabilities
 
 - **Multi-language Twitch discovery.** Resolves any Twitch game by name, paginates clip results, and filters by ISO 639-1 language directly on the client.
@@ -73,7 +69,6 @@ start.bat
    sudo apt update
    sudo apt install -y ffmpeg fonts-dejavu-core fonts-noto-cjk xdg-utils
    ```
-
 2. Create a virtual environment and install Python dependencies.
 
    ```bash
@@ -81,7 +76,6 @@ start.bat
    source .venv/bin/activate
    pip install -r requirements.txt
    ```
-
 3. Configure optional credentials.
 
    ```bash
@@ -90,7 +84,6 @@ start.bat
    ```
 
    Twitch credentials enable automated clip discovery. LLM credentials enable model-generated metadata and translation. Public Twitch and YouTube URLs work without credentials.
-
 4. Launch the studio.
 
    ```bash
@@ -111,6 +104,8 @@ Select target language and game, then fetch clips via Twitch Helix or paste publ
 
 Calibrate webcam coordinates, toggle split-screen and blurred layouts, adjust subtitle typography, and save per-streamer crop presets.
 
+![Crop and Style](docs/screenshots/02-crop-studio.png)
+
 ### 3. Batch Render & Preview
 
 Render queued clips in their native language or generate translated variants. Review side-by-side vertical video players and localized publishing metadata.
@@ -120,6 +115,9 @@ Render queued clips in their native language or generate translated variants. Re
 ### 4. Settings & Channels
 
 Manage `.env` credentials, select Whisper transcription models, toggle anti-duplicate fingerprinting, and authorize per-language YouTube channels.
+
+![Settings and Channels](docs/screenshots/04-settings-channels.png)
+
 
 ## Output Structure
 
@@ -139,36 +137,36 @@ Webcam crops are saved in `presets.json`. YouTube OAuth tokens and upload histor
 
 ### Environment variables (`.env`)
 
-| Variable | Required | Description |
-| --- | --- | --- |
-| `TWITCH_CLIENT_ID` | For Twitch discovery | Client ID from the Twitch Developer Console. |
-| `TWITCH_CLIENT_SECRET` | For Twitch discovery | Client secret for app access token generation. |
-| `LLM_API_KEY` / `OPENAI_API_KEY` | No | API key for an OpenAI-compatible endpoint. |
-| `LLM_BASE_URL` | No | API base URL. Defaults to `https://api.groq.com/openai/v1`. |
-| `LLM_MODEL` | No | Metadata and translation model. Defaults to `llama-3.1-8b-instant`. |
+| Variable                             | Required             | Description                                                           |
+| ------------------------------------ | -------------------- | --------------------------------------------------------------------- |
+| `TWITCH_CLIENT_ID`                 | For Twitch discovery | Client ID from the Twitch Developer Console.                          |
+| `TWITCH_CLIENT_SECRET`             | For Twitch discovery | Client secret for app access token generation.                        |
+| `LLM_API_KEY` / `OPENAI_API_KEY` | No                   | API key for an OpenAI-compatible endpoint.                            |
+| `LLM_BASE_URL`                     | No                   | API base URL. Defaults to `https://api.groq.com/openai/v1`.         |
+| `LLM_MODEL`                        | No                   | Metadata and translation model. Defaults to `llama-3.1-8b-instant`. |
 
 Without an LLM key, Stream2Short uses built-in localized templates with `deep-translator` fallbacks.
 
 ### `config.yaml`
 
-| Key | Default | Description |
-| --- | --- | --- |
-| `default_game` | `Grand Theft Auto VI` | Game used by the fetcher and metadata templates. |
-| `default_language` | `en` | Source language when a clip has no stored language. |
-| `supported_languages` | `[en, uk, es, de, fr, pl, pt, ru, ja, ko]` | Language codes shown in the user interface. |
-| `width` / `height` | `1080` / `1920` | Output resolution (9:16 aspect ratio). |
-| `whisper_model` | `small` | CPU transcription model: `tiny`, `base`, `small`, or `medium`. |
-| `compute_type` | `int8` | faster-whisper quantization type. |
-| `font_family` | `DejaVu Sans` | Subtitle font family. |
-| `font_size` | `36` | Subtitle text size at 1080x1920. |
-| `primary_color` | `#FFFF00` | Subtitle fill color. |
-| `outline_thickness` | `2` | Subtitle outline width in pixels. |
-| `margin_v` | `220` | Bottom safe zone in pixels. |
-| `anti_duplicate_enabled` | `true` | Enables subtle zoom, colour grading, and speed adjustments. |
-| `anti_duplicate_scale` | `1.04` | Fingerprint zoom factor. |
-| `anti_duplicate_contrast` | `1.03` | Fingerprint contrast adjustment factor. |
-| `anti_duplicate_saturation` | `1.05` | Fingerprint saturation adjustment factor. |
-| `anti_duplicate_speed` | `1.02` | Playback speed factor (subtitles are rescaled proportionally). |
+| Key                           | Default                                      | Description                                                            |
+| ----------------------------- | -------------------------------------------- | ---------------------------------------------------------------------- |
+| `default_game`              | `Grand Theft Auto VI`                      | Game used by the fetcher and metadata templates.                       |
+| `default_language`          | `en`                                       | Source language when a clip has no stored language.                    |
+| `supported_languages`       | `[en, uk, es, de, fr, pl, pt, ru, ja, ko]` | Language codes shown in the user interface.                            |
+| `width` / `height`        | `1080` / `1920`                          | Output resolution (9:16 aspect ratio).                                 |
+| `whisper_model`             | `small`                                    | CPU transcription model: `tiny`, `base`, `small`, or `medium`. |
+| `compute_type`              | `int8`                                     | faster-whisper quantization type.                                      |
+| `font_family`               | `DejaVu Sans`                              | Subtitle font family.                                                  |
+| `font_size`                 | `36`                                       | Subtitle text size at 1080x1920.                                       |
+| `primary_color`             | `#FFFF00`                                  | Subtitle fill color.                                                   |
+| `outline_thickness`         | `2`                                        | Subtitle outline width in pixels.                                      |
+| `margin_v`                  | `220`                                      | Bottom safe zone in pixels.                                            |
+| `anti_duplicate_enabled`    | `true`                                     | Enables subtle zoom, colour grading, and speed adjustments.            |
+| `anti_duplicate_scale`      | `1.04`                                     | Fingerprint zoom factor.                                               |
+| `anti_duplicate_contrast`   | `1.03`                                     | Fingerprint contrast adjustment factor.                                |
+| `anti_duplicate_saturation` | `1.05`                                     | Fingerprint saturation adjustment factor.                              |
+| `anti_duplicate_speed`      | `1.02`                                     | Playback speed factor (subtitles are rescaled proportionally).         |
 
 ### YouTube OAuth
 
@@ -181,17 +179,17 @@ Scheduling applies ISO 8601 `publishAt` timestamps with configurable spacing and
 
 ## Architecture
 
-| Path | Responsibility |
-| --- | --- |
-| `app.py` | Streamlit studio user interface and pipeline orchestration. |
-| `src/languages.py` | ISO 639-1 normalization, language names, badges, and code validation. |
-| `src/fetcher.py` | Twitch Helix game resolution, paginated language filtering, and yt-dlp media downloads. |
-| `src/transcriber.py` | faster-whisper transcription, ASS subtitle generation, localized metadata, and translation. |
-| `src/renderer.py` | FFmpeg 9:16 compositor, safe UTF-8 textfile banners, and fingerprinting filters. |
-| `src/fonts.py` | Cross-platform font file and font family resolution (Linux, macOS, Windows). |
-| `src/ffmpeg_bin.py` | Cross-platform FFmpeg and ffprobe binary detection with imageio-ffmpeg fallback. |
-| `src/uploader.py` | YouTube Data API v3 uploads with per-language OAuth tokens and quota tracking. |
-| `tests/smoke_test.py` | Zero-key end-to-end English and Ukrainian verification. |
+| Path                    | Responsibility                                                                              |
+| ----------------------- | ------------------------------------------------------------------------------------------- |
+| `app.py`              | Streamlit studio user interface and pipeline orchestration.                                 |
+| `src/languages.py`    | ISO 639-1 normalization, language names, badges, and code validation.                       |
+| `src/fetcher.py`      | Twitch Helix game resolution, paginated language filtering, and yt-dlp media downloads.     |
+| `src/transcriber.py`  | faster-whisper transcription, ASS subtitle generation, localized metadata, and translation. |
+| `src/renderer.py`     | FFmpeg 9:16 compositor, safe UTF-8 textfile banners, and fingerprinting filters.            |
+| `src/fonts.py`        | Cross-platform font file and font family resolution (Linux, macOS, Windows).                |
+| `src/ffmpeg_bin.py`   | Cross-platform FFmpeg and ffprobe binary detection with imageio-ffmpeg fallback.            |
+| `src/uploader.py`     | YouTube Data API v3 uploads with per-language OAuth tokens and quota tracking.              |
+| `tests/smoke_test.py` | Zero-key end-to-end English and Ukrainian verification.                                     |
 
 ## Verification
 
