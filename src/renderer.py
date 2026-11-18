@@ -19,13 +19,17 @@ from typing import Any
 import yaml
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
+from src.ffmpeg_bin import ffmpeg_exe, ffprobe_exe
 from src.fonts import (
     CJK_FONT_CANDIDATES,
     CJK_FONT_FAMILIES,
+)
+from src.fonts import (
     font_family_for as _platform_font_family,
+)
+from src.fonts import (
     resolve_font_path as _platform_resolve_font_path,
 )
-from src.ffmpeg_bin import ffmpeg_exe, ffprobe_exe
 from src.languages import normalize_language, validate_language_code
 
 logger = logging.getLogger(__name__)
@@ -145,8 +149,8 @@ def _ffmpeg_filter_path(path: Path) -> str:
 
     Uses a PROJECT_ROOT-relative path with forward slashes so Windows drive
     colons stay out of the filtergraph; falls back to the absolute path when
-    the target is on a different drive.  Single quotes are escaped for the
-    filter parser and the result is already wrapped in single quotes.
+    the target is on a different drive. Single quotes and colons are escaped
+    for the filter parser and the result is wrapped in single quotes.
     """
     target = Path(path).resolve()
     try:
@@ -154,7 +158,8 @@ def _ffmpeg_filter_path(path: Path) -> str:
     except ValueError:
         text = str(target)
     text = text.replace("\\", "/")
-    text = text.replace("'", "\\'")
+    text = text.replace(":", r"\:")
+    text = text.replace("'", r"\'")
     return f"'{text}'"
 
 

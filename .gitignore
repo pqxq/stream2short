@@ -1,10 +1,22 @@
+# Python
 .venv/
 __pycache__/
 *.py[cod]
+
+# Secrets & credentials
 .env
+data/token_*.json
+data/client_secret.json
+
+# Tool caches
 .opencode/
 .ruff_cache/
 .pytest_cache/
-data/
-workspace/
-output/
+
+# Generated media & runtime files
+workspace/raw/*.mp4
+workspace/temp/*
+!workspace/temp/.gitkeep
+output/*/*.mp4
+data/processed_clips.json
+data/upload_history.json

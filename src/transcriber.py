@@ -22,8 +22,8 @@ import yaml
 from deep_translator import GoogleTranslator
 from faster_whisper import WhisperModel
 
-from src.fonts import CJK_FONT_CANDIDATES, CJK_FONT_FAMILIES
 from src.ffmpeg_bin import ffmpeg_exe
+from src.fonts import CJK_FONT_CANDIDATES
 from src.languages import (
     DEFAULT_SUPPORTED_LANGUAGES,
     language_name,
@@ -241,8 +241,12 @@ def ensure_dirs() -> None:
 
 
 def _run_ffmpeg(command: list[str]) -> None:
+    exe = ffmpeg_exe()
+    if not exe:
+        raise RuntimeError("ffmpeg is not installed or not on PATH.")
+    resolved = [exe if item == "ffmpeg" else item for item in command]
     try:
-        subprocess.run(command, check=True, capture_output=True, text=True)
+        subprocess.run(resolved, check=True, capture_output=True, text=True)
     except FileNotFoundError as exc:
         raise RuntimeError("ffmpeg is not installed or not on PATH.") from exc
     except subprocess.CalledProcessError as exc:
@@ -479,7 +483,7 @@ class ASSGenerator:
 
     def _font_family_for(self, lang: str | None) -> str:
         code = normalize_language(lang)
-        if code in {"ja", "ko"} and any(Path(path).exists() for path in CJK_FONT_PATHS):
+        if code in {"ja", "ko"} and any(Path(path).exists() for path in CJK_FONT_CANDIDATES):
             return "Noto Sans CJK JP" if code == "ja" else "Noto Sans CJK KR"
         return self.font_family
 
@@ -488,7 +492,7 @@ class ASSGenerator:
         font_family = self._font_family_for(lang)
         lines = [
             "[Script Info]",
-            "Title: Universal Clip Studio",
+            "Title: Stream2Short",
             "ScriptType: v4.00+",
             "WrapStyle: 0",
             "ScaledBorderAndShadow: yes",
@@ -540,11 +544,14 @@ class LocalizationEngine:
         llm_model: str | None = None,
     ) -> None:
         self.llm_url = llm_url or os.getenv("LLM_BASE_URL")
-        self.llm_key = llm_key or os.getenv("LLM_API_KEY")
-        self.llm_model = llm_model or os.getenv("LLM_MODEL")
+        self.llm_key = llm_key or os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
+        self.llm_model = llm_model or os.getenv("LLM_MODEL") or "gpt-4o-mini"
         self.client: openai.OpenAI | None = None
-        if self.llm_key and self.llm_url:
-            self.client = openai.OpenAI(api_key=self.llm_key, base_url=self.llm_url)
+        if self.llm_key:
+            if self.llm_url:
+                self.client = openai.OpenAI(api_key=self.llm_key, base_url=self.llm_url)
+            else:
+                self.client = openai.OpenAI(api_key=self.llm_key)
         logger.info(
             "Localization backend: %s",
             "LLM" if self.client else "Deep-Translator/template fallback",

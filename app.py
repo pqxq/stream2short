@@ -10,8 +10,8 @@ import importlib.util
 import json
 import logging
 import os
+import platform
 import re
-import shutil
 import subprocess
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -23,6 +23,7 @@ from dotenv import load_dotenv, set_key
 from PIL import Image
 
 from src.fetcher import ClipFetcher, fetch_twitch_clips, load_processed_clips
+from src.ffmpeg_bin import has_ffmpeg, has_ffprobe
 from src.languages import (
     language_badge,
     language_name,
@@ -50,7 +51,7 @@ RAW_DIR = PROJECT_ROOT / "workspace" / "raw"
 TEMP_DIR = PROJECT_ROOT / "workspace" / "temp"
 OUTPUT_ROOT = PROJECT_ROOT / "output"
 
-HAS_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
+HAS_FFMPEG = has_ffmpeg() and has_ffprobe()
 WHISPER_AVAILABLE = importlib.util.find_spec("faster_whisper") is not None
 
 ALL_LANGUAGES = "__all__"
@@ -324,16 +325,30 @@ def generate_synthetic_test_clip(
 
 
 def open_output_folder(path: Path) -> bool:
+    system = platform.system()
     try:
-        subprocess.Popen(
-            ["xdg-open", str(path)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+        if system == "Windows":
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        elif system == "Darwin":
+            subprocess.Popen(
+                ["open", str(path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        else:
+            subprocess.Popen(
+                ["xdg-open", str(path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
         return True
-    except (OSError, FileNotFoundError):
+    except (OSError, FileNotFoundError, AttributeError):
         return False
+
+
+open_folder = open_output_folder
 
 
 def _update_config_value(key: str, value: Any) -> None:
@@ -1079,7 +1094,7 @@ def _render_variant_panel(
         if open_output_folder(folder):
             st.success(f"Opened {folder}")
         else:
-            st.error("Could not launch xdg-open. Folder: " + str(folder))
+            st.error(f"Could not open folder: {folder}")
 
     if action_cols[2].button("Schedule to YouTube", key=f"schedule_{clip_id}_{lang_code}"):
         if not video_path or not Path(video_path).exists():
@@ -1169,6 +1184,13 @@ def tab_batch_render() -> None:
                 key="render_target_language",
                 disabled=not translate_enabled,
             )
+        if translate_enabled and not (
+            os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
+        ):
+            st.caption(
+                "Tip: No LLM API key detected in .env. Translation will use "
+                "deep-translator with localized template fallback."
+            )
         apply_uniqueness = st.checkbox(
             "Apply anti-duplicate fingerprinting",
             key="render_uniqueness",
@@ -1250,11 +1272,11 @@ def tab_settings_channels() -> None:
             help="Stored as TWITCH_CLIENT_SECRET in .env. Required for Twitch clip discovery.",
         )
         llm_key = st.text_input(
-            "LLM API Key",
-            value=os.getenv("LLM_API_KEY", ""),
+            "LLM / OpenAI API Key",
+            value=os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY", ""),
             type="password",
             key="env_llm_key",
-            help="Stored as LLM_API_KEY. Optional; enables LLM metadata and translation.",
+            help="Stored as LLM_API_KEY in .env. Optional; enables LLM metadata and translation.",
         )
         llm_url = st.text_input(
             "LLM Base URL",
