@@ -1,5 +1,6 @@
 # Stream2Short
 
+[![CI](https://github.com/pqxq/stream2short/actions/workflows/ci.yml/badge.svg)](https://github.com/pqxq/stream2short/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.40%2B-FF4B4B.svg)](https://streamlit.io/)
@@ -90,7 +91,7 @@ start.bat
    streamlit run app.py
    ```
 
-## Interface Walkthrough
+	## Interface Walkthrough
 
 The studio interface is organized into four tabs:
 
@@ -117,7 +118,6 @@ Render queued clips in their native language or generate translated variants. Re
 Manage `.env` credentials, select Whisper transcription models, toggle anti-duplicate fingerprinting, and authorize per-language YouTube channels.
 
 ![Settings and Channels](docs/screenshots/04-settings-channels.png)
-
 
 ## Output Structure
 

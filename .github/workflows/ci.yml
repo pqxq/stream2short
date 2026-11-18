@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.11"]
+
+    runs-on: \${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: \${{ matrix.python-version }}
+
+      - name: Install lint and lightweight runtime dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff pyyaml pillow imageio-ffmpeg
+
+      - name: Bytecode compilation check
+        run: python -m py_compile app.py src/*.py tests/smoke_test.py
+
+      - name: Ruff lint
+        run: ruff check .
+
+      - name: Cross-platform FFmpeg, font, and language smoke check
+        run: |
+          python -c "
+          from src.ffmpeg_bin import resolve_ffmpeg_binaries
+          from src.fonts import resolve_bold_font
+          from src.languages import get_language_label, normalize_language_code
+          ffmpeg_bin, _ = resolve_ffmpeg_binaries()
+          assert ffmpeg_bin, 'FFmpeg binary not resolved'
+          assert normalize_language_code('UK') == 'uk'
+          assert get_language_label('en')
+          _ = resolve_bold_font()
+          print('Cross-platform runtime checks passed:', ffmpeg_bin)
+          "
